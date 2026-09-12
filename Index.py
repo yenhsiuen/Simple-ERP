@@ -16,7 +16,10 @@ def get_options(item):
   return options
 
 
-def insert_purchas(n1,n2,n3,n4,n5,n6,n7):
+def insert_purchas(supplier_id, product_id, qty, unit_price, total_price, unit, currency_id, year, month):
+
+  if not supplier_id or not product_id or not qty or not unit_price:
+    return gr.update(value=get_purchases_table(year, month)), "⚠️ 廠商、貨品、數量、單價都必須填寫"
 
   sql = """
       INSERT INTO purchases
@@ -24,13 +27,17 @@ def insert_purchas(n1,n2,n3,n4,n5,n6,n7):
       VALUES (%s, %s, %s, %s, %s, %s, %s)
   """
 
-  mycursor.execute(sql, (n1, n2, n3, n4, n5, n6, n7))
+  mycursor.execute(sql, (supplier_id, product_id, qty, unit_price, total_price, unit, currency_id))
 
   mydb.commit()
-  print(mycursor.rowcount,"資料儲存成功")
+  msg = f"✅ 新增成功，共新增 {mycursor.rowcount} 筆進貨紀錄"
+  return gr.update(value=get_purchases_table(year, month)), msg
 
 
-def insert_sale(n1,n2,n3,n4,n5,n6):
+def insert_sale(customer_id, product_id, qty, unit_price, total_price, unit, year, month):
+
+  if not customer_id or not product_id or not qty or not unit_price:
+    return gr.update(value=get_sales_table(year, month)), "⚠️ 客戶、貨品、數量、單價都必須填寫"
 
   sql = """
       INSERT INTO sales
@@ -38,10 +45,11 @@ def insert_sale(n1,n2,n3,n4,n5,n6):
       VALUES (%s, %s, %s, %s, %s, %s)
   """
 
-  mycursor.execute(sql, (n1, n2, n3, n4, n5, n6))
+  mycursor.execute(sql, (customer_id, product_id, qty, unit_price, total_price, unit))
 
   mydb.commit()
-  print(mycursor.rowcount,"資料儲存成功")
+  msg = f"✅ 新增成功，共新增 {mycursor.rowcount} 筆出貨紀錄"
+  return gr.update(value=get_sales_table(year, month)), msg
 
 
 def get_available_year_months():
@@ -118,29 +126,43 @@ def get_basic_list(table):
 def insert_basic_data(table, name):
     """新增一筆基礎資料（廠商/貨品/顧客/幣別），id 交給資料庫 AUTO_INCREMENT"""
     name = (name or "").strip()
-    if name:
-        sql = "INSERT INTO %s (name) VALUES (%%s)" % table
-        mycursor.execute(sql, (name,))
-        mydb.commit()
-        print(f"{table} 新增成功：{name}")
-    # 不管有沒有新增成功，都回傳最新清單，順便清空輸入框
-    return get_basic_list(table), ""
+    if not name:
+        return get_basic_list(table), "", "⚠️ 名稱不可空白，請輸入後再新增"
+    sql = "INSERT INTO %s (name) VALUES (%%s)" % table
+    mycursor.execute(sql, (name,))
+    mydb.commit()
+    msg = f"✅ 新增成功：{name}"
+    return get_basic_list(table), "", msg
 
 
 def insert_supplier(name):
-    return insert_basic_data("suppliers", name)
+    lst, cleared, msg = insert_basic_data("suppliers", name)
+    return gr.update(value=lst), cleared, msg, gr.update(choices=get_options("suppliers"))
 
 
 def insert_product(name):
-    return insert_basic_data("products", name)
+    lst, cleared, msg = insert_basic_data("products", name)
+    new_choices = get_options("products")
+    # 貨品同時被「進貨」跟「出貨」頁面使用，兩邊下拉選單都要一起更新
+    return gr.update(value=lst), cleared, msg, gr.update(choices=new_choices), gr.update(choices=new_choices)
 
 
 def insert_customer(name):
-    return insert_basic_data("customers", name)
+    lst, cleared, msg = insert_basic_data("customers", name)
+    return gr.update(value=lst), cleared, msg, gr.update(choices=get_options("customers"))
 
 
 def insert_currency(name):
-    return insert_basic_data("currency", name)
+    lst, cleared, msg = insert_basic_data("currency", name)
+    return gr.update(value=lst), cleared, msg, gr.update(choices=get_options("currency"))
+
+
+def refresh_purchases_table(year, month):
+    return gr.update(value=get_purchases_table(year, month))
+
+
+def refresh_sales_table(year, month):
+    return gr.update(value=get_sales_table(year, month))
 
 
 def auto_calculate_total(qty_str, price_str):
@@ -166,6 +188,7 @@ with gr.Blocks() as demo:
                 total2 = gr.Textbox(label="總額(可手動修改)")
                 unit_dp2 = gr.Dropdown(choices=["公斤", "隻", "箱", "件"], value="公斤", label="計量單位",interactive=True)
                 insert2 = gr.Button("新增")
+            sale_msg = gr.Markdown("")
 
             gr.Markdown("<h3 style='margin-top: 40px;'>出貨紀錄</h3>")
             with gr.Row():
@@ -198,6 +221,7 @@ with gr.Blocks() as demo:
             sales_table = gr.Dataframe(
                 value=get_sales_table(str(latest_year_s), f"{latest_month_s:02d}"),
                 headers=["時間", "客戶", "貨品", "數量", "單位", "單價", "總額"],
+                row_count=(1, "dynamic"),
             )
         with gr.TabItem("進貨", id="purchases"):
             with gr.Row():
@@ -210,6 +234,7 @@ with gr.Blocks() as demo:
                 unit_dp = gr.Dropdown(choices=["公斤", "隻", "箱", "件"], value="公斤", label="計量單位",interactive=True)
                 Cur_dp = gr.Dropdown(choices=get_options("currency"),label="幣別",interactive=True)
                 insert = gr.Button("新增")
+            purchase_msg = gr.Markdown("")
 
 
             gr.Markdown("<h3 style='margin-top: 40px;'>進貨紀錄</h3>")
@@ -243,67 +268,86 @@ with gr.Blocks() as demo:
             purchases_table = gr.Dataframe(
                 value=get_purchases_table(str(latest_year), f"{latest_month:02d}"),
                 headers=["時間", "廠商", "貨品", "數量", "單位", "單價", "總額", "幣別"],
+                row_count=(1, "dynamic"),
             )
 
-        with gr.TabItem("基礎資料設定", id="basic_data"):
-            with gr.Tabs():
-                with gr.TabItem("廠商"):
-                    with gr.Row():
-                        sup_name = gr.Textbox(label="廠商名稱", scale=3)
-                        sup_add_btn = gr.Button("新增廠商", scale=1)
-                    sup_list = gr.Dataframe(
-                        value=get_basic_list("suppliers"),
-                        headers=["ID", "名稱"],
-                        label="廠商清單",
-                    )
+        with gr.TabItem("廠商設定", id="suppliers_setting"):
+            with gr.Row():
+                sup_name = gr.Textbox(label="廠商名稱", scale=3)
+                sup_add_btn = gr.Button("新增廠商", scale=1)
+            sup_msg = gr.Markdown("")
+            sup_list = gr.Dataframe(
+                value=get_basic_list("suppliers"),
+                headers=["ID", "名稱"],
+                label="廠商清單",
+                row_count=(1, "dynamic"),
+            )
 
-                with gr.TabItem("貨品"):
-                    with gr.Row():
-                        pro_name = gr.Textbox(label="貨品名稱", scale=3)
-                        pro_add_btn = gr.Button("新增貨品", scale=1)
-                    pro_list = gr.Dataframe(
-                        value=get_basic_list("products"),
-                        headers=["ID", "名稱"],
-                        label="貨品清單",
-                    )
+        with gr.TabItem("貨品設定", id="products_setting"):
+            with gr.Row():
+                pro_name = gr.Textbox(label="貨品名稱", scale=3)
+                pro_add_btn = gr.Button("新增貨品", scale=1)
+            pro_msg = gr.Markdown("")
+            pro_list = gr.Dataframe(
+                value=get_basic_list("products"),
+                headers=["ID", "名稱"],
+                label="貨品清單",
+                row_count=(1, "dynamic"),
+            )
 
-                with gr.TabItem("顧客"):
-                    with gr.Row():
-                        cus_name = gr.Textbox(label="顧客名稱", scale=3)
-                        cus_add_btn = gr.Button("新增顧客", scale=1)
-                    cus_list = gr.Dataframe(
-                        value=get_basic_list("customers"),
-                        headers=["ID", "名稱"],
-                        label="顧客清單",
-                    )
+        with gr.TabItem("顧客設定", id="customers_setting"):
+            with gr.Row():
+                cus_name = gr.Textbox(label="顧客名稱", scale=3)
+                cus_add_btn = gr.Button("新增顧客", scale=1)
+            cus_msg = gr.Markdown("")
+            cus_list = gr.Dataframe(
+                value=get_basic_list("customers"),
+                headers=["ID", "名稱"],
+                label="顧客清單",
+                row_count=(1, "dynamic"),
+            )
 
-                with gr.TabItem("幣別"):
-                    with gr.Row():
-                        cur_name = gr.Textbox(label="幣別名稱", scale=3)
-                        cur_add_btn = gr.Button("新增幣別", scale=1)
-                    cur_list = gr.Dataframe(
-                        value=get_basic_list("currency"),
-                        headers=["ID", "名稱"],
-                        label="幣別清單",
-                    )
+        with gr.TabItem("幣別設定", id="currency_setting"):
+            with gr.Row():
+                cur_name = gr.Textbox(label="幣別名稱", scale=3)
+                cur_add_btn = gr.Button("新增幣別", scale=1)
+            cur_msg = gr.Markdown("")
+            cur_list = gr.Dataframe(
+                value=get_basic_list("currency"),
+                headers=["ID", "名稱"],
+                label="幣別清單",
+                row_count=(1, "dynamic"),
+            )
 
     # 使用 update 語法動態切換選取的頁籤 id
 
-    insert.click(fn=insert_purchas, inputs=[sup_dp, pro_dp, qua, unit_pri, total, unit_dp, Cur_dp], outputs=purchases_table)
-    refresh_btn.click(fn=get_purchases_table, inputs=[year_dp, month_dp], outputs=purchases_table)
+    insert.click(fn=insert_purchas, inputs=[sup_dp, pro_dp, qua, unit_pri, total, unit_dp, Cur_dp, year_dp, month_dp], outputs=[purchases_table, purchase_msg])
+    refresh_btn.click(fn=refresh_purchases_table, inputs=[year_dp, month_dp], outputs=purchases_table)
 # 當數量 (t1) 或單價 (t2) 改變時，自動去計算總額 (t3)
     qua.change(fn=auto_calculate_total, inputs=[qua, unit_pri], outputs=total)
     unit_pri.change(fn=auto_calculate_total, inputs=[qua, unit_pri], outputs=total)
 
-    insert2.click(fn=insert_sale, inputs=[cus_dp, pro_dp2, qua2, unit_pri2, total2, unit_dp2], outputs=sales_table)
-    refresh_btn2.click(fn=get_sales_table, inputs=[year_dp2, month_dp2], outputs=sales_table)
+    insert2.click(fn=insert_sale, inputs=[cus_dp, pro_dp2, qua2, unit_pri2, total2, unit_dp2, year_dp2, month_dp2], outputs=[sales_table, sale_msg])
+    refresh_btn2.click(fn=refresh_sales_table, inputs=[year_dp2, month_dp2], outputs=sales_table)
     qua2.change(fn=auto_calculate_total, inputs=[qua2, unit_pri2], outputs=total2)
     unit_pri2.change(fn=auto_calculate_total, inputs=[qua2, unit_pri2], outputs=total2)
 
-    sup_add_btn.click(fn=insert_supplier, inputs=sup_name, outputs=[sup_list, sup_name])
-    pro_add_btn.click(fn=insert_product, inputs=pro_name, outputs=[pro_list, pro_name])
-    cus_add_btn.click(fn=insert_customer, inputs=cus_name, outputs=[cus_list, cus_name])
-    cur_add_btn.click(fn=insert_currency, inputs=cur_name, outputs=[cur_list, cur_name])
+    # 新增基礎資料後：更新清單、清空輸入框、顯示成功訊息，並連動刷新進貨/出貨頁面的下拉選單
+    sup_add_btn.click(fn=insert_supplier, inputs=sup_name, outputs=[sup_list, sup_name, sup_msg, sup_dp]) \
+        .then(fn=lambda: gr.update(visible=False), outputs=sup_list) \
+        .then(fn=lambda: gr.update(visible=True), outputs=sup_list)
+
+    pro_add_btn.click(fn=insert_product, inputs=pro_name, outputs=[pro_list, pro_name, pro_msg, pro_dp, pro_dp2]) \
+        .then(fn=lambda: gr.update(visible=False), outputs=pro_list) \
+        .then(fn=lambda: gr.update(visible=True), outputs=pro_list)
+
+    cus_add_btn.click(fn=insert_customer, inputs=cus_name, outputs=[cus_list, cus_name, cus_msg, cus_dp]) \
+        .then(fn=lambda: gr.update(visible=False), outputs=cus_list) \
+        .then(fn=lambda: gr.update(visible=True), outputs=cus_list)
+
+    cur_add_btn.click(fn=insert_currency, inputs=cur_name, outputs=[cur_list, cur_name, cur_msg, Cur_dp]) \
+        .then(fn=lambda: gr.update(visible=False), outputs=cur_list) \
+        .then(fn=lambda: gr.update(visible=True), outputs=cur_list)
 
 
 
