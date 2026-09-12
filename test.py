@@ -137,30 +137,39 @@ def insert_basic_data(table, name):
 
 def insert_supplier(name):
     lst, cleared, msg = insert_basic_data("suppliers", name)
-    return gr.update(value=lst), cleared, msg, gr.update(choices=get_options("suppliers"))
+    return gr.update(value=lst), cleared, msg
 
 
 def insert_product(name):
-    lst, cleared, msg = insert_basic_data("products", name)
-    new_choices = get_options("products")
-    # 貨品同時被「進貨」跟「出貨」頁面使用，兩邊下拉選單都要一起更新
-    return gr.update(value=lst), cleared, msg, gr.update(choices=new_choices), gr.update(choices=new_choices)
-
-
-def insert_product_test_only_same_tab(name):
-    """測試用：只更新『貨品設定』分頁自己的元件，完全不碰進貨/出貨頁的下拉選單"""
     lst, cleared, msg = insert_basic_data("products", name)
     return gr.update(value=lst), cleared, msg
 
 
 def insert_customer(name):
     lst, cleared, msg = insert_basic_data("customers", name)
-    return gr.update(value=lst), cleared, msg, gr.update(choices=get_options("customers"))
+    return gr.update(value=lst), cleared, msg
 
 
 def insert_currency(name):
     lst, cleared, msg = insert_basic_data("currency", name)
-    return gr.update(value=lst), cleared, msg, gr.update(choices=get_options("currency"))
+    return gr.update(value=lst), cleared, msg
+
+
+def refresh_purchase_dropdowns():
+    """點進『進貨』分頁時，重新查一次廠商/貨品/幣別下拉選單，確保永遠是最新的"""
+    return (
+        gr.update(choices=get_options("suppliers")),
+        gr.update(choices=get_options("products")),
+        gr.update(choices=get_options("currency")),
+    )
+
+
+def refresh_sales_dropdowns():
+    """點進『出貨』分頁時，重新查一次客戶/貨品下拉選單，確保永遠是最新的"""
+    return (
+        gr.update(choices=get_options("customers")),
+        gr.update(choices=get_options("products")),
+    )
 
 
 def refresh_purchases_table(year, month):
@@ -185,7 +194,11 @@ def auto_calculate_total(qty_str, price_str):
 
 with gr.Blocks() as demo:
     with gr.Tabs() as tabs:
-        with gr.TabItem("出貨", id="sales"):
+        with gr.TabItem("首頁", id="home"):
+            gr.Markdown(
+                "## 歡迎使用川海 ERP\n\n請從上方分頁選擇「出貨」「進貨」或「基礎資料設定」開始操作。"
+            )
+        with gr.TabItem("出貨", id="sales") as sales_tab:
             with gr.Row():
                 cus_dp = gr.Dropdown(choices=get_options("customers"),label="客戶",interactive=True)
                 pro_dp2 = gr.Dropdown(choices=get_options("products"),label="貨品",interactive=True)
@@ -229,7 +242,7 @@ with gr.Blocks() as demo:
                 headers=["時間", "客戶", "貨品", "數量", "單位", "單價", "總額"],
                 row_count=(1, "dynamic"),
             )
-        with gr.TabItem("進貨", id="purchases"):
+        with gr.TabItem("進貨", id="purchases") as purchases_tab:
             with gr.Row():
                 sup_dp = gr.Dropdown(choices=get_options("suppliers"),label="廠商",interactive=True)
                 pro_dp = gr.Dropdown(choices=get_options("products"),label="貨品",interactive=True)
@@ -277,53 +290,55 @@ with gr.Blocks() as demo:
                 row_count=(1, "dynamic"),
             )
 
-        with gr.TabItem("廠商設定", id="suppliers_setting"):
-            with gr.Row():
-                sup_name = gr.Textbox(label="廠商名稱", scale=3)
-                sup_add_btn = gr.Button("新增廠商", scale=1)
-            sup_msg = gr.Markdown("")
-            sup_list = gr.Dataframe(
-                value=get_basic_list("suppliers"),
-                headers=["ID", "名稱"],
-                label="廠商清單",
-                row_count=(1, "dynamic"),
-            )
+        with gr.TabItem("基礎資料設定", id="basic_data"):
+            with gr.Tabs():
+                with gr.TabItem("廠商"):
+                    with gr.Row():
+                        sup_name = gr.Textbox(label="廠商名稱", scale=3)
+                        sup_add_btn = gr.Button("新增廠商", scale=1)
+                    sup_msg = gr.Markdown("")
+                    sup_list = gr.Dataframe(
+                        value=get_basic_list("suppliers"),
+                        headers=["ID", "名稱"],
+                        label="廠商清單",
+                        row_count=(1, "dynamic"),
+                    )
 
-        with gr.TabItem("貨品設定", id="products_setting"):
-            with gr.Row():
-                pro_name = gr.Textbox(label="貨品名稱", scale=3)
-                pro_add_btn = gr.Button("新增貨品", scale=1)
-            pro_msg = gr.Markdown("")
-            pro_list = gr.Dataframe(
-                value=get_basic_list("products"),
-                headers=["ID", "名稱"],
-                label="貨品清單",
-                row_count=(1, "dynamic"),
-            )
+                with gr.TabItem("貨品"):
+                    with gr.Row():
+                        pro_name = gr.Textbox(label="貨品名稱", scale=3)
+                        pro_add_btn = gr.Button("新增貨品", scale=1)
+                    pro_msg = gr.Markdown("")
+                    pro_list = gr.Dataframe(
+                        value=get_basic_list("products"),
+                        headers=["ID", "名稱"],
+                        label="貨品清單",
+                        row_count=(1, "dynamic"),
+                    )
 
-        with gr.TabItem("顧客設定", id="customers_setting"):
-            with gr.Row():
-                cus_name = gr.Textbox(label="顧客名稱", scale=3)
-                cus_add_btn = gr.Button("新增顧客", scale=1)
-            cus_msg = gr.Markdown("")
-            cus_list = gr.Dataframe(
-                value=get_basic_list("customers"),
-                headers=["ID", "名稱"],
-                label="顧客清單",
-                row_count=(1, "dynamic"),
-            )
+                with gr.TabItem("顧客"):
+                    with gr.Row():
+                        cus_name = gr.Textbox(label="顧客名稱", scale=3)
+                        cus_add_btn = gr.Button("新增顧客", scale=1)
+                    cus_msg = gr.Markdown("")
+                    cus_list = gr.Dataframe(
+                        value=get_basic_list("customers"),
+                        headers=["ID", "名稱"],
+                        label="顧客清單",
+                        row_count=(1, "dynamic"),
+                    )
 
-        with gr.TabItem("幣別設定", id="currency_setting"):
-            with gr.Row():
-                cur_name = gr.Textbox(label="幣別名稱", scale=3)
-                cur_add_btn = gr.Button("新增幣別", scale=1)
-            cur_msg = gr.Markdown("")
-            cur_list = gr.Dataframe(
-                value=get_basic_list("currency"),
-                headers=["ID", "名稱"],
-                label="幣別清單",
-                row_count=(1, "dynamic"),
-            )
+                with gr.TabItem("幣別"):
+                    with gr.Row():
+                        cur_name = gr.Textbox(label="幣別名稱", scale=3)
+                        cur_add_btn = gr.Button("新增幣別", scale=1)
+                    cur_msg = gr.Markdown("")
+                    cur_list = gr.Dataframe(
+                        value=get_basic_list("currency"),
+                        headers=["ID", "名稱"],
+                        label="幣別清單",
+                        row_count=(1, "dynamic"),
+                    )
 
     # 使用 update 語法動態切換選取的頁籤 id
 
@@ -338,21 +353,27 @@ with gr.Blocks() as demo:
     qua2.change(fn=auto_calculate_total, inputs=[qua2, unit_pri2], outputs=total2)
     unit_pri2.change(fn=auto_calculate_total, inputs=[qua2, unit_pri2], outputs=total2)
 
-    # 新增基礎資料後：更新清單、清空輸入框、顯示成功訊息，並連動刷新進貨/出貨頁面的下拉選單
-    sup_add_btn.click(fn=insert_supplier, inputs=sup_name, outputs=[sup_list, sup_name, sup_msg, sup_dp]) \
+    # 新增基礎資料後：更新自己分頁的清單、清空輸入框、顯示成功訊息
+    # 巢狀分頁裡的 Dataframe 需要額外「隱藏再顯示」一次，才會強制重繪
+    sup_add_btn.click(fn=insert_supplier, inputs=sup_name, outputs=[sup_list, sup_name, sup_msg]) \
         .then(fn=lambda: gr.update(visible=False), outputs=sup_list) \
         .then(fn=lambda: gr.update(visible=True), outputs=sup_list)
 
-    # 測試用：先不更新其他分頁的下拉選單，也先不加隱藏/顯示的 workaround，驗證是不是「跨分頁 outputs」造成的
-    pro_add_btn.click(fn=insert_product_test_only_same_tab, inputs=pro_name, outputs=[pro_list, pro_name, pro_msg])
+    pro_add_btn.click(fn=insert_product, inputs=pro_name, outputs=[pro_list, pro_name, pro_msg]) \
+        .then(fn=lambda: gr.update(visible=False), outputs=pro_list) \
+        .then(fn=lambda: gr.update(visible=True), outputs=pro_list)
 
-    cus_add_btn.click(fn=insert_customer, inputs=cus_name, outputs=[cus_list, cus_name, cus_msg, cus_dp]) \
+    cus_add_btn.click(fn=insert_customer, inputs=cus_name, outputs=[cus_list, cus_name, cus_msg]) \
         .then(fn=lambda: gr.update(visible=False), outputs=cus_list) \
         .then(fn=lambda: gr.update(visible=True), outputs=cus_list)
 
-    cur_add_btn.click(fn=insert_currency, inputs=cur_name, outputs=[cur_list, cur_name, cur_msg, Cur_dp]) \
+    cur_add_btn.click(fn=insert_currency, inputs=cur_name, outputs=[cur_list, cur_name, cur_msg]) \
         .then(fn=lambda: gr.update(visible=False), outputs=cur_list) \
         .then(fn=lambda: gr.update(visible=True), outputs=cur_list)
+
+    # 每次點進「進貨」「出貨」分頁時，重新查一次下拉選單，確保永遠是最新資料
+    purchases_tab.select(fn=refresh_purchase_dropdowns, outputs=[sup_dp, pro_dp, Cur_dp])
+    sales_tab.select(fn=refresh_sales_dropdowns, outputs=[cus_dp, pro_dp2])
 
 
 
