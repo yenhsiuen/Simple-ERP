@@ -693,7 +693,8 @@ with gr.Blocks() as demo:
 
 
 try:
-    demo.launch()
+    # 建立暫時的 Gradio 公網分享網址；每次重啟後請使用終端機輸出的新網址。
+    demo.launch(share=True, server_port=8082, auth=[("ly", "ly")])
 finally:
     mycursor.close()
     mydb.close()
