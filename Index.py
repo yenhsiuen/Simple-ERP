@@ -308,6 +308,160 @@ def delete_sale(edit_id, year, month):
         return gr.update(value=display), "⚠️ 刪除失敗，請稍後再試", raw, edit_id
 
 
+# ========== 庫存 ==========
+
+def get_month_cutoff(year, month):
+    """回傳『下個月第一天』的日期字串，用來當作『這個月月底之前』的查詢邊界"""
+    year, month = int(year), int(month)
+    if month == 12:
+        next_year, next_month = year + 1, 1
+    else:
+        next_year, next_month = year, month + 1
+    return f"{next_year}-{next_month:02d}-01"
+
+
+def get_inventory_year_months():
+    """合併進貨、出貨兩張表出現過的年月，供庫存頁的年月選單使用"""
+    sql = """
+        SELECT y, m FROM (
+            SELECT YEAR(transaction_time) AS y, MONTH(transaction_time) AS m FROM purchases WHERE transaction_time IS NOT NULL
+            UNION
+            SELECT YEAR(transaction_time) AS y, MONTH(transaction_time) AS m FROM sales WHERE transaction_time IS NOT NULL
+        ) t
+        ORDER BY y DESC, m DESC
+    """
+    mycursor.execute(sql)
+    return [(row[0], row[1]) for row in mycursor.fetchall()]
+
+
+def get_theoretical_inventory(year, month):
+    """計算每個『貨品+單位』組合到『該月月底』為止的理論庫存 = 累計進貨量 - 累計出貨量
+    因為公斤跟隻是不同的計量方式，不能加在一起，所以分開統計"""
+    cutoff = get_month_cutoff(year, month)
+
+    mycursor.execute(
+        "SELECT product_id, unit, SUM(quantity) FROM purchases WHERE transaction_time < %s GROUP BY product_id, unit",
+        (cutoff,),
+    )
+    in_map = {(pid, unit): float(qty) for pid, unit, qty in mycursor.fetchall()}
+
+    mycursor.execute(
+        "SELECT product_id, unit, SUM(quantity) FROM sales WHERE transaction_time < %s GROUP BY product_id, unit",
+        (cutoff,),
+    )
+    out_map = {(pid, unit): float(qty) for pid, unit, qty in mycursor.fetchall()}
+
+    mycursor.execute("SELECT id, name FROM products")
+    name_map = {pid: name for pid, name in mycursor.fetchall()}
+
+    keys = sorted(set(in_map) | set(out_map), key=lambda k: (k[0], k[1]))
+    result = []
+    for pid, unit in keys:
+        theoretical = in_map.get((pid, unit), 0.0) - out_map.get((pid, unit), 0.0)
+        name = name_map.get(pid, f"(未知貨品 #{pid})")
+        result.append((pid, unit, name, theoretical))
+    return result
+
+
+def get_actual_counts(year, month):
+    """取得某年月已登記的實際盤點數量，回傳 {(product_id, unit): 數量}"""
+    sql = "SELECT product_id, unit, actual_quantity FROM inventory_counts WHERE year=%s AND month=%s"
+    mycursor.execute(sql, (int(year), int(month)))
+    return {(pid, unit): float(qty) for pid, unit, qty in mycursor.fetchall()}
+
+
+def get_inventory_table(year, month):
+    """組合理論庫存與實際盤點，回傳畫面顯示用的表格，以及修改/刪除用的原始資料"""
+    theoretical_list = get_theoretical_inventory(year, month)
+    actual_map = get_actual_counts(year, month)
+
+    display_rows = []
+    raw_rows = []
+    for pid, unit, name, theo in theoretical_list:
+        actual = actual_map.get((pid, unit))
+        if actual is None:
+            display_rows.append([name, unit, theo, "尚未盤點", "-"])
+        else:
+            diff = round(theo - actual, 2)
+            display_rows.append([name, unit, theo, actual, diff])
+        raw_rows.append([pid, unit, theo, actual])
+    return display_rows, raw_rows
+
+
+def refresh_inventory_table(year, month):
+    display, raw = get_inventory_table(year, month)
+    return gr.update(value=display), raw
+
+
+def select_inventory_row(evt: gr.SelectData, raw_data):
+    """點選庫存清單某一列時，把該貨品與單位帶入下方的盤點登記表單。
+    同時從畫面上的資料裡找出同一貨品『另一個單位』的已登記數字存起來，
+    這樣之後在表單裡切換單位時，可以自動帶出對應的實際盤點數量"""
+    row_idx = evt.index[0]
+    pid, unit, theo, actual = raw_data[row_idx]
+
+    other_unit = "隻" if unit == "公斤" else "公斤"
+    other_actual = None
+    for r in raw_data:
+        if r[0] == pid and r[1] == other_unit:
+            other_actual = r[3]
+            break
+    state = {unit: actual, other_unit: other_actual}
+
+    actual_str = "" if actual is None else str(actual)
+    msg = f"已選取此貨品（單位：{unit}），理論庫存為 {theo}，切換單位會自動帶出對應的實際盤點數量"
+    return gr.update(value=pid), gr.update(value=unit), actual_str, msg, state
+
+
+def switch_inventory_unit(unit, state):
+    """切換盤點表單的單位時，自動帶出這個貨品在該單位下已登記的實際數量"""
+    if not state:
+        return gr.update()
+    actual = state.get(unit)
+    return "" if actual is None else str(actual)
+
+
+def save_inventory_count(product_id, unit, actual_qty, year, month):
+    display, raw = get_inventory_table(year, month)
+    if not product_id or not unit:
+        return gr.update(value=display), "⚠️ 請先選擇貨品與單位", raw
+
+    qty_f = parse_positive_number(actual_qty)
+    if qty_f is None:
+        return gr.update(value=display), "⚠️ 實際盤點數量必須是有效的數字", raw
+
+    sql = """
+        INSERT INTO inventory_counts (product_id, unit, year, month, actual_quantity)
+        VALUES (%s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE actual_quantity = VALUES(actual_quantity), recorded_at = CURRENT_TIMESTAMP
+    """
+    mycursor.execute(sql, (product_id, unit, int(year), int(month), qty_f))
+    mydb.commit()
+    msg = "✅ 盤點已登記"
+    display, raw = get_inventory_table(year, month)
+    return gr.update(value=display), msg, raw
+
+
+def clear_inventory_count(product_id, unit, year, month):
+    display, raw = get_inventory_table(year, month)
+    if not product_id or not unit:
+        return gr.update(value=display), "⚠️ 請先選擇貨品與單位", raw
+    mycursor.execute(
+        "DELETE FROM inventory_counts WHERE product_id=%s AND unit=%s AND year=%s AND month=%s",
+        (product_id, unit, int(year), int(month)),
+    )
+    mydb.commit()
+    msg = "✅ 已清除此筆盤點紀錄（恢復成尚未盤點）"
+    display, raw = get_inventory_table(year, month)
+    return gr.update(value=display), msg, raw
+
+
+def refresh_inventory_product_dropdown():
+    """點進『庫存』分頁時，重新查一次貨品下拉選單"""
+    return gr.update(choices=get_options("products"))
+
+
+
 # ========== 基礎資料 ==========
 
 def get_basic_list(table):
@@ -459,7 +613,7 @@ with gr.Blocks() as demo:
         with gr.TabItem("首頁", id="home"):
             gr.Markdown(
                 "## 歡迎使用川海 ERP\n\n"
-                "請從上方分頁選擇「出貨」、「進貨」或「基礎資料設定」開始操作。\n\n"
+                "請從上方分頁選擇「出貨」、「進貨」、「庫存」或「基礎資料設定」開始操作。\n\n"
                 "廠商／貨品／顧客／幣別的新增、修改、刪除，都可在本頁面的「基礎資料設定」分頁完成。"
             )
 
@@ -471,7 +625,7 @@ with gr.Blocks() as demo:
                 qua2 = gr.Textbox(label="數量")
                 unit_pri2 = gr.Textbox(label="單價")
                 total2 = gr.Textbox(label="總額(可手動修改)")
-                unit_dp2 = gr.Dropdown(choices=["公斤", "隻", "箱", "件"], value="公斤", label="計量單位", interactive=True)
+                unit_dp2 = gr.Dropdown(choices=["公斤", "隻"], value="公斤", label="計量單位", interactive=True)
             with gr.Row():
                 insert2 = gr.Button("新增")
                 sale_update_btn = gr.Button("修改所選")
@@ -523,7 +677,7 @@ with gr.Blocks() as demo:
                 unit_pri = gr.Textbox(label="單價")
                 total = gr.Textbox(label="總額(可手動修改)")
                 # 新增商品或交易時，單位寫死常用選項，簡單又不會出錯
-                unit_dp = gr.Dropdown(choices=["公斤", "隻", "箱", "件"], value="公斤", label="計量單位", interactive=True)
+                unit_dp = gr.Dropdown(choices=["公斤", "隻"], value="公斤", label="計量單位", interactive=True)
                 Cur_dp = gr.Dropdown(choices=get_options("currency"), label="幣別", interactive=True)
             with gr.Row():
                 insert = gr.Button("新增")
@@ -566,6 +720,58 @@ with gr.Blocks() as demo:
                 interactive=False,
             )
             purchases_raw_state = gr.State(value=get_purchases_raw(str(latest_year), f"{latest_month:02d}"))
+
+        with gr.TabItem("庫存", id="inventory") as inventory_tab:
+            gr.Markdown(
+                "理論庫存 = 從系統最早的進貨/出貨紀錄開始，累加到所選月份月底為止。\n\n"
+                "點清單裡的一列可以帶入下方表單，登記或更新該貨品這個月的實際盤點數量；"
+                "沒有登記實際盤點的貨品，不會計算死傷。"
+            )
+            with gr.Row():
+                inv_year_months = get_inventory_year_months()
+                if inv_year_months:
+                    inv_latest_year, inv_latest_month = inv_year_months[0]
+                else:
+                    now = datetime.now()
+                    inv_latest_year, inv_latest_month = now.year, now.month
+
+                inv_available_years = sorted({str(y) for y, m in inv_year_months}, reverse=True)
+                if not inv_available_years:
+                    inv_available_years = [str(inv_latest_year)]
+
+                inv_year_dp = gr.Dropdown(
+                    choices=inv_available_years,
+                    value=str(inv_latest_year),
+                    label="年份",
+                    interactive=True,
+                )
+                inv_month_dp = gr.Dropdown(
+                    choices=[f"{m:02d}" for m in range(1, 13)],
+                    value=f"{inv_latest_month:02d}",
+                    label="月份",
+                    interactive=True,
+                )
+                inv_refresh_btn = gr.Button("查詢")
+
+            inv_display_init, inv_raw_init = get_inventory_table(str(inv_latest_year), f"{inv_latest_month:02d}")
+            inventory_table = gr.Dataframe(
+                value=inv_display_init,
+                headers=["貨品", "單位", "理論庫存", "實際盤點", "死傷（理論-實際）"],
+                row_count=(1, "dynamic"),
+                interactive=False,
+            )
+            inventory_raw_state = gr.State(value=inv_raw_init)
+            inventory_selected_state = gr.State(value=None)
+
+            gr.Markdown("<h4 style='margin-top: 30px;'>登記 / 更新實際盤點</h4>")
+            with gr.Row():
+                inv_pro_dp = gr.Dropdown(choices=get_options("products"), label="貨品", interactive=True)
+                inv_unit_dp = gr.Dropdown(choices=["公斤", "隻"], label="單位", interactive=True)
+                inv_actual_qty = gr.Textbox(label="實際盤點數量")
+            with gr.Row():
+                inv_save_btn = gr.Button("登記盤點")
+                inv_clear_btn = gr.Button("清除此筆盤點", variant="stop")
+            inv_msg = gr.Markdown("")
 
         with gr.TabItem("基礎資料設定", id="basic-data"):
             gr.Markdown("管理廠商、貨品、顧客與幣別。點選清單的一列後，可修改或刪除該筆資料。")
@@ -666,6 +872,34 @@ with gr.Blocks() as demo:
         outputs=[sales_table, sale_msg, sales_raw_state, sale_edit_id],
     )
 
+    # ---------- 庫存 ----------
+    inv_refresh_btn.click(
+        fn=refresh_inventory_table,
+        inputs=[inv_year_dp, inv_month_dp],
+        outputs=[inventory_table, inventory_raw_state],
+    )
+    inventory_table.select(
+        fn=select_inventory_row,
+        inputs=inventory_raw_state,
+        outputs=[inv_pro_dp, inv_unit_dp, inv_actual_qty, inv_msg, inventory_selected_state],
+    )
+    inv_unit_dp.change(
+        fn=switch_inventory_unit,
+        inputs=[inv_unit_dp, inventory_selected_state],
+        outputs=inv_actual_qty,
+    )
+    inv_save_btn.click(
+        fn=save_inventory_count,
+        inputs=[inv_pro_dp, inv_unit_dp, inv_actual_qty, inv_year_dp, inv_month_dp],
+        outputs=[inventory_table, inv_msg, inventory_raw_state],
+    )
+    inv_clear_btn.click(
+        fn=clear_inventory_count,
+        inputs=[inv_pro_dp, inv_unit_dp, inv_year_dp, inv_month_dp],
+        outputs=[inventory_table, inv_msg, inventory_raw_state],
+    )
+    inventory_tab.select(fn=refresh_inventory_product_dropdown, outputs=[inv_pro_dp])
+
     # ---------- 基礎資料 ----------
     sup_add_btn.click(fn=insert_supplier, inputs=sup_name, outputs=[sup_list, sup_name, sup_msg])
     sup_list.select(fn=select_basic_row, inputs=sup_list, outputs=[sup_edit_id, sup_name, sup_msg])
@@ -687,7 +921,7 @@ with gr.Blocks() as demo:
     cur_update_btn.click(fn=update_currency, inputs=[cur_edit_id, cur_name], outputs=[cur_list, cur_edit_id, cur_name, cur_msg])
     cur_delete_btn.click(fn=delete_currency, inputs=cur_edit_id, outputs=[cur_list, cur_edit_id, cur_name, cur_msg])
 
-    # ---------- 進貨/出貨分頁：每次點進去都重新查一次下拉選單 ----------
+    # ---------- 進貨/出貨/庫存分頁：每次點進去都重新查一次下拉選單 ----------
     purchases_tab.select(fn=refresh_purchase_dropdowns, outputs=[sup_dp, pro_dp, Cur_dp])
     sales_tab.select(fn=refresh_sales_dropdowns, outputs=[cus_dp, pro_dp2])
 
