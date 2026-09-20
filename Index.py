@@ -807,6 +807,235 @@ def refresh_dashboard_year_choices():
     return gr.update(choices=years)
 
 
+# ========== 應收帳款 ==========
+
+def get_customer_balances():
+    """每個客戶：累計出貨總額、累計已收金額、應收餘額"""
+    mycursor.execute("SELECT customer_id, SUM(total_price) FROM sales GROUP BY customer_id")
+    sales_map = {cid: float(amt) for cid, amt in mycursor.fetchall()}
+    mycursor.execute("SELECT customer_id, SUM(amount) FROM receivable_payments GROUP BY customer_id")
+    paid_map = {cid: float(amt) for cid, amt in mycursor.fetchall()}
+    mycursor.execute("SELECT id, name FROM customers")
+    name_map = {cid: name for cid, name in mycursor.fetchall()}
+
+    rows = []
+    for cid in set(sales_map) | set(paid_map):
+        total = sales_map.get(cid, 0.0)
+        paid = paid_map.get(cid, 0.0)
+        rows.append([name_map.get(cid, f"(未知客戶 #{cid})"), total, paid, round(total - paid, 2)])
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def get_receivable_payments_list():
+    sql = """
+        SELECT rp.id, c.name, rp.payment_date, rp.amount, rp.note, rp.customer_id
+        FROM receivable_payments rp
+        LEFT JOIN customers c ON rp.customer_id = c.id
+        ORDER BY rp.payment_date DESC, rp.id DESC
+    """
+    mycursor.execute(sql)
+    display_rows, raw_rows = [], []
+    for rid, cname, pdate, amount, note, customer_id in mycursor.fetchall():
+        display_rows.append([cname, str(pdate), float(amount), note or ""])
+        raw_rows.append([rid, customer_id, str(pdate), float(amount), note or ""])
+    return display_rows, raw_rows
+
+
+def refresh_receivable_page():
+    balance_display = get_customer_balances()
+    payment_display, payment_raw = get_receivable_payments_list()
+    return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw
+
+
+def parse_date_str(val):
+    val = (val or "").strip()
+    try:
+        datetime.strptime(val, "%Y-%m-%d")
+        return val
+    except ValueError:
+        return None
+
+
+def select_receivable_row(evt: gr.SelectData, raw_data):
+    row_idx = evt.index[0]
+    rid, customer_id, pdate, amount, note = raw_data[row_idx]
+    msg = "已選取此筆收款紀錄，可以修改或刪除"
+    return rid, gr.update(value=customer_id), pdate, str(amount), note, msg
+
+
+def insert_receivable_payment(customer_id, pdate, amount, note):
+    balance_display = get_customer_balances()
+    payment_display, payment_raw = get_receivable_payments_list()
+    if not customer_id:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 請選擇客戶"
+    date_ok = parse_date_str(pdate)
+    if date_ok is None:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 日期格式必須是 YYYY-MM-DD"
+    amt_f = parse_positive_number(amount)
+    if amt_f is None:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 金額必須是有效的數字"
+
+    mycursor.execute(
+        "INSERT INTO receivable_payments (customer_id, payment_date, amount, note) VALUES (%s, %s, %s, %s)",
+        (customer_id, date_ok, amt_f, (note or "").strip() or None),
+    )
+    mydb.commit()
+    balance_display = get_customer_balances()
+    payment_display, payment_raw = get_receivable_payments_list()
+    return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "✅ 新增成功"
+
+
+def update_receivable_payment(edit_id, customer_id, pdate, amount, note):
+    balance_display = get_customer_balances()
+    payment_display, payment_raw = get_receivable_payments_list()
+    if edit_id is None:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 請先選取一筆紀錄再修改", edit_id
+    if not customer_id:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 請選擇客戶", edit_id
+    date_ok = parse_date_str(pdate)
+    if date_ok is None:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 日期格式必須是 YYYY-MM-DD", edit_id
+    amt_f = parse_positive_number(amount)
+    if amt_f is None:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 金額必須是有效的數字", edit_id
+
+    mycursor.execute(
+        "UPDATE receivable_payments SET customer_id=%s, payment_date=%s, amount=%s, note=%s WHERE id=%s",
+        (customer_id, date_ok, amt_f, (note or "").strip() or None, edit_id),
+    )
+    mydb.commit()
+    balance_display = get_customer_balances()
+    payment_display, payment_raw = get_receivable_payments_list()
+    return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "✅ 修改成功", None
+
+
+def delete_receivable_payment(edit_id):
+    balance_display = get_customer_balances()
+    payment_display, payment_raw = get_receivable_payments_list()
+    if edit_id is None:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 請先選取一筆紀錄再刪除", edit_id
+    mycursor.execute("DELETE FROM receivable_payments WHERE id=%s", (edit_id,))
+    mydb.commit()
+    balance_display = get_customer_balances()
+    payment_display, payment_raw = get_receivable_payments_list()
+    return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "✅ 已刪除", None
+
+
+def refresh_receivable_customer_dropdown():
+    return gr.update(choices=get_options("customers"))
+
+
+# ========== 應付帳款 ==========
+
+def get_supplier_balances():
+    """每個廠商：累計進貨總額、累計已付金額、應付餘額"""
+    mycursor.execute("SELECT supplier_id, SUM(total_price) FROM purchases GROUP BY supplier_id")
+    purchases_map = {sid: float(amt) for sid, amt in mycursor.fetchall()}
+    mycursor.execute("SELECT supplier_id, SUM(amount) FROM payable_payments GROUP BY supplier_id")
+    paid_map = {sid: float(amt) for sid, amt in mycursor.fetchall()}
+    mycursor.execute("SELECT id, name FROM suppliers")
+    name_map = {sid: name for sid, name in mycursor.fetchall()}
+
+    rows = []
+    for sid in set(purchases_map) | set(paid_map):
+        total = purchases_map.get(sid, 0.0)
+        paid = paid_map.get(sid, 0.0)
+        rows.append([name_map.get(sid, f"(未知廠商 #{sid})"), total, paid, round(total - paid, 2)])
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def get_payable_payments_list():
+    sql = """
+        SELECT pp.id, s.name, pp.payment_date, pp.amount, pp.note, pp.supplier_id
+        FROM payable_payments pp
+        LEFT JOIN suppliers s ON pp.supplier_id = s.id
+        ORDER BY pp.payment_date DESC, pp.id DESC
+    """
+    mycursor.execute(sql)
+    display_rows, raw_rows = [], []
+    for rid, sname, pdate, amount, note, supplier_id in mycursor.fetchall():
+        display_rows.append([sname, str(pdate), float(amount), note or ""])
+        raw_rows.append([rid, supplier_id, str(pdate), float(amount), note or ""])
+    return display_rows, raw_rows
+
+
+def refresh_payable_page():
+    balance_display = get_supplier_balances()
+    payment_display, payment_raw = get_payable_payments_list()
+    return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw
+
+
+def select_payable_row(evt: gr.SelectData, raw_data):
+    row_idx = evt.index[0]
+    rid, supplier_id, pdate, amount, note = raw_data[row_idx]
+    msg = "已選取此筆付款紀錄，可以修改或刪除"
+    return rid, gr.update(value=supplier_id), pdate, str(amount), note, msg
+
+
+def insert_payable_payment(supplier_id, pdate, amount, note):
+    balance_display = get_supplier_balances()
+    payment_display, payment_raw = get_payable_payments_list()
+    if not supplier_id:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 請選擇廠商"
+    date_ok = parse_date_str(pdate)
+    if date_ok is None:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 日期格式必須是 YYYY-MM-DD"
+    amt_f = parse_positive_number(amount)
+    if amt_f is None:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 金額必須是有效的數字"
+
+    mycursor.execute(
+        "INSERT INTO payable_payments (supplier_id, payment_date, amount, note) VALUES (%s, %s, %s, %s)",
+        (supplier_id, date_ok, amt_f, (note or "").strip() or None),
+    )
+    mydb.commit()
+    balance_display = get_supplier_balances()
+    payment_display, payment_raw = get_payable_payments_list()
+    return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "✅ 新增成功"
+
+
+def update_payable_payment(edit_id, supplier_id, pdate, amount, note):
+    balance_display = get_supplier_balances()
+    payment_display, payment_raw = get_payable_payments_list()
+    if edit_id is None:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 請先選取一筆紀錄再修改", edit_id
+    if not supplier_id:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 請選擇廠商", edit_id
+    date_ok = parse_date_str(pdate)
+    if date_ok is None:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 日期格式必須是 YYYY-MM-DD", edit_id
+    amt_f = parse_positive_number(amount)
+    if amt_f is None:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 金額必須是有效的數字", edit_id
+
+    mycursor.execute(
+        "UPDATE payable_payments SET supplier_id=%s, payment_date=%s, amount=%s, note=%s WHERE id=%s",
+        (supplier_id, date_ok, amt_f, (note or "").strip() or None, edit_id),
+    )
+    mydb.commit()
+    balance_display = get_supplier_balances()
+    payment_display, payment_raw = get_payable_payments_list()
+    return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "✅ 修改成功", None
+
+
+def delete_payable_payment(edit_id):
+    balance_display = get_supplier_balances()
+    payment_display, payment_raw = get_payable_payments_list()
+    if edit_id is None:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 請先選取一筆紀錄再刪除", edit_id
+    mycursor.execute("DELETE FROM payable_payments WHERE id=%s", (edit_id,))
+    mydb.commit()
+    balance_display = get_supplier_balances()
+    payment_display, payment_raw = get_payable_payments_list()
+    return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "✅ 已刪除", None
+
+
+def refresh_payable_supplier_dropdown():
+    return gr.update(choices=get_options("suppliers"))
+
+
 # ========== 基礎資料 ==========
 
 def get_basic_list(table):
@@ -1239,6 +1468,74 @@ with gr.Blocks() as demo:
                 height=350,
             )
 
+        with gr.TabItem("應收/應付帳款", id="receivable_payable") as receivable_payable_tab:
+            with gr.Tabs():
+                with gr.TabItem("應收"):
+                    gr.Markdown("每個客戶累計出貨總額、已收金額，以及還沒收到的應收款餘額。")
+                    rec_balance_init = get_customer_balances()
+                    rec_balance_table = gr.Dataframe(
+                        value=rec_balance_init,
+                        headers=["客戶", "累計出貨總額", "已收金額", "應收款餘額"],
+                        row_count=(1, "dynamic"),
+                        interactive=False,
+                    )
+
+                    gr.Markdown("<h4 style='margin-top: 30px;'>登記收款</h4>")
+                    rec_edit_id = gr.State(value=None)
+                    with gr.Row():
+                        rec_cus_dp = gr.Dropdown(choices=get_options("customers"), label="客戶", interactive=True)
+                        rec_date_tb = gr.Textbox(label="日期", value=datetime.now().strftime("%Y-%m-%d"))
+                        rec_amount_tb = gr.Textbox(label="收款金額")
+                        rec_note_tb = gr.Textbox(label="備註（選填）")
+                    with gr.Row():
+                        rec_add_btn = gr.Button("新增收款")
+                        rec_update_btn = gr.Button("修改所選")
+                        rec_delete_btn = gr.Button("刪除所選", variant="stop")
+                    rec_msg = gr.Markdown("")
+
+                    gr.Markdown("<h4 style='margin-top: 20px;'>收款紀錄（點一列可選取來修改或刪除）</h4>")
+                    rec_payment_display_init, rec_payment_raw_init = get_receivable_payments_list()
+                    rec_payment_table = gr.Dataframe(
+                        value=rec_payment_display_init,
+                        headers=["客戶", "日期", "金額", "備註"],
+                        row_count=(1, "dynamic"),
+                        interactive=False,
+                    )
+                    rec_payment_raw_state = gr.State(value=rec_payment_raw_init)
+
+                with gr.TabItem("應付"):
+                    gr.Markdown("每個廠商累計進貨總額、已付金額，以及還沒付的應付款餘額。")
+                    pay_balance_init = get_supplier_balances()
+                    pay_balance_table = gr.Dataframe(
+                        value=pay_balance_init,
+                        headers=["廠商", "累計進貨總額", "已付金額", "應付款餘額"],
+                        row_count=(1, "dynamic"),
+                        interactive=False,
+                    )
+
+                    gr.Markdown("<h4 style='margin-top: 30px;'>登記付款</h4>")
+                    pay_edit_id = gr.State(value=None)
+                    with gr.Row():
+                        pay_sup_dp = gr.Dropdown(choices=get_options("suppliers"), label="廠商", interactive=True)
+                        pay_date_tb = gr.Textbox(label="日期", value=datetime.now().strftime("%Y-%m-%d"))
+                        pay_amount_tb = gr.Textbox(label="付款金額")
+                        pay_note_tb = gr.Textbox(label="備註（選填）")
+                    with gr.Row():
+                        pay_add_btn = gr.Button("新增付款")
+                        pay_update_btn = gr.Button("修改所選")
+                        pay_delete_btn = gr.Button("刪除所選", variant="stop")
+                    pay_msg = gr.Markdown("")
+
+                    gr.Markdown("<h4 style='margin-top: 20px;'>付款紀錄（點一列可選取來修改或刪除）</h4>")
+                    pay_payment_display_init, pay_payment_raw_init = get_payable_payments_list()
+                    pay_payment_table = gr.Dataframe(
+                        value=pay_payment_display_init,
+                        headers=["廠商", "日期", "金額", "備註"],
+                        row_count=(1, "dynamic"),
+                        interactive=False,
+                    )
+                    pay_payment_raw_state = gr.State(value=pay_payment_raw_init)
+
     # ---------- 進貨 ----------
     insert.click(
         fn=insert_purchas,
@@ -1389,6 +1686,76 @@ with gr.Blocks() as demo:
     # ---------- 進貨/出貨/庫存分頁：每次點進去都重新查一次下拉選單 ----------
     purchases_tab.select(fn=refresh_purchase_dropdowns, outputs=[sup_dp, pro_dp, Cur_dp])
     sales_tab.select(fn=refresh_sales_dropdowns, outputs=[cus_dp, pro_dp2])
+
+    # ---------- 應收帳款 ----------
+    rec_payment_table.select(
+        fn=select_receivable_row,
+        inputs=rec_payment_raw_state,
+        outputs=[rec_edit_id, rec_cus_dp, rec_date_tb, rec_amount_tb, rec_note_tb, rec_msg],
+    )
+    rec_add_btn.click(
+        fn=insert_receivable_payment,
+        inputs=[rec_cus_dp, rec_date_tb, rec_amount_tb, rec_note_tb],
+        outputs=[rec_balance_table, rec_payment_table, rec_payment_raw_state, rec_msg],
+    )
+    rec_update_btn.click(
+        fn=update_receivable_payment,
+        inputs=[rec_edit_id, rec_cus_dp, rec_date_tb, rec_amount_tb, rec_note_tb],
+        outputs=[rec_balance_table, rec_payment_table, rec_payment_raw_state, rec_msg, rec_edit_id],
+    )
+    rec_delete_btn.click(
+        fn=delete_receivable_payment,
+        inputs=rec_edit_id,
+        outputs=[rec_balance_table, rec_payment_table, rec_payment_raw_state, rec_msg, rec_edit_id],
+    )
+
+    # ---------- 應付帳款 ----------
+    pay_payment_table.select(
+        fn=select_payable_row,
+        inputs=pay_payment_raw_state,
+        outputs=[pay_edit_id, pay_sup_dp, pay_date_tb, pay_amount_tb, pay_note_tb, pay_msg],
+    )
+    pay_add_btn.click(
+        fn=insert_payable_payment,
+        inputs=[pay_sup_dp, pay_date_tb, pay_amount_tb, pay_note_tb],
+        outputs=[pay_balance_table, pay_payment_table, pay_payment_raw_state, pay_msg],
+    )
+    pay_update_btn.click(
+        fn=update_payable_payment,
+        inputs=[pay_edit_id, pay_sup_dp, pay_date_tb, pay_amount_tb, pay_note_tb],
+        outputs=[pay_balance_table, pay_payment_table, pay_payment_raw_state, pay_msg, pay_edit_id],
+    )
+    pay_delete_btn.click(
+        fn=delete_payable_payment,
+        inputs=pay_edit_id,
+        outputs=[pay_balance_table, pay_payment_table, pay_payment_raw_state, pay_msg, pay_edit_id],
+    )
+
+    # ---------- 應收/應付帳款：每次點進這個分頁，重新查一次下拉選單跟表格 ----------
+    def refresh_receivable_payable_page():
+        rec_balance = get_customer_balances()
+        rec_payment_display, rec_payment_raw = get_receivable_payments_list()
+        pay_balance = get_supplier_balances()
+        pay_payment_display, pay_payment_raw = get_payable_payments_list()
+        return (
+            gr.update(choices=get_options("customers")),
+            gr.update(choices=get_options("suppliers")),
+            gr.update(value=rec_balance),
+            gr.update(value=rec_payment_display),
+            rec_payment_raw,
+            gr.update(value=pay_balance),
+            gr.update(value=pay_payment_display),
+            pay_payment_raw,
+        )
+
+    receivable_payable_tab.select(
+        fn=refresh_receivable_payable_page,
+        outputs=[
+            rec_cus_dp, pay_sup_dp,
+            rec_balance_table, rec_payment_table, rec_payment_raw_state,
+            pay_balance_table, pay_payment_table, pay_payment_raw_state,
+        ],
+    )
 
 
 try:
