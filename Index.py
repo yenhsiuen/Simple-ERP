@@ -1,5 +1,6 @@
 import pymysql
 import gradio as gr
+import pandas as pd
 from datetime import datetime
 
 mydb = pymysql.connect(host="localhost", user="root", password="4567", database="川海erp")
@@ -462,6 +463,350 @@ def refresh_inventory_product_dropdown():
 
 
 
+# ========== 匯率 ==========
+
+def is_base_currency(currency_id):
+    """判斷這個幣別是不是台幣（名稱為 TWD / 台幣 / 新台幣），台幣不需要登記匯率，直接視為 1:1"""
+    mycursor.execute("SELECT name FROM currency WHERE id=%s", (currency_id,))
+    row = mycursor.fetchone()
+    if not row:
+        return False
+    name = row[0].strip().upper()
+    return name in ("TWD", "台幣", "新台幣", "NTD")
+
+
+# 常見幣別對台幣的「大概」匯率，只在使用者還沒登記真實匯率時當備用估計值，
+# 這些數字不會自動更新、也不保證準確，只是先讓報表有個粗略數字可以看，
+# 有登記真實匯率時一律優先使用真實登記的匯率。
+DEFAULT_RATE_GUESSES = {
+    "USD": 32.0, "美金": 32.0, "美元": 32.0,
+    "CNY": 4.4, "RMB": 4.4, "人民幣": 4.4,
+    "VND": 0.0013, "越南盾": 0.0013,
+    "IDR": 0.002, "印尼盾": 0.002,
+    "PHP": 0.57, "披索": 0.57, "菲律賓披索": 0.57,
+    "JPY": 0.21, "日圓": 0.21, "日幣": 0.21,
+    "EUR": 34.8, "歐元": 34.8,
+    "HKD": 4.1, "港幣": 4.1,
+}
+
+
+def get_currency_name(currency_id):
+    mycursor.execute("SELECT name FROM currency WHERE id=%s", (currency_id,))
+    row = mycursor.fetchone()
+    return row[0] if row else f"#{currency_id}"
+
+
+def get_default_rate_guess(currency_id):
+    """查內建的大概匯率對照表；找不到就回傳 None"""
+    name = get_currency_name(currency_id).strip().upper()
+    return DEFAULT_RATE_GUESSES.get(name)
+
+
+def get_exchange_rate(currency_id, year, month):
+    """取得某幣別在某年月對台幣的匯率。
+    回傳 (匯率, 是否為估計值)：
+      - 台幣：(1.0, False)
+      - 有登記真實匯率：(登記的匯率, False)
+      - 沒登記但內建有大概匯率：(大概匯率, True)
+      - 完全沒有依據：(1.0, True) 當最後手段"""
+    if is_base_currency(currency_id):
+        return 1.0, False
+    mycursor.execute(
+        "SELECT rate_to_twd FROM exchange_rates WHERE currency_id=%s AND year=%s AND month=%s",
+        (currency_id, int(year), int(month)),
+    )
+    row = mycursor.fetchone()
+    if row:
+        return float(row[0]), False
+    guess = get_default_rate_guess(currency_id)
+    if guess is not None:
+        return guess, True
+    return 1.0, True
+
+
+def get_exchange_rate_list():
+    """取得所有已登記的匯率，供畫面顯示與選取"""
+    sql = """
+        SELECT er.id, cur.name, er.year, er.month, er.rate_to_twd, er.currency_id
+        FROM exchange_rates er
+        LEFT JOIN currency cur ON er.currency_id = cur.id
+        ORDER BY er.year DESC, er.month DESC, cur.name
+    """
+    mycursor.execute(sql)
+    display_rows, raw_rows = [], []
+    for rid, cname, y, m, rate, currency_id in mycursor.fetchall():
+        display_rows.append([cname, y, m, float(rate)])
+        raw_rows.append([rid, currency_id, y, m, float(rate)])
+    return display_rows, raw_rows
+
+
+def refresh_exchange_rate_list():
+    display, raw = get_exchange_rate_list()
+    return gr.update(value=display), raw
+
+
+def select_exchange_rate_row(evt: gr.SelectData, raw_data):
+    row_idx = evt.index[0]
+    rid, currency_id, year, month, rate = raw_data[row_idx]
+    msg = f"已選取此筆匯率紀錄，可以修改或刪除"
+    return (
+        rid,
+        gr.update(value=currency_id),
+        str(year),
+        f"{int(month):02d}",
+        str(rate),
+        msg,
+    )
+
+
+def save_exchange_rate(edit_id, currency_id, year, month, rate):
+    display, raw = get_exchange_rate_list()
+    if not currency_id or not year or not month:
+        return gr.update(value=display), "⚠️ 幣別、年份、月份都必須填寫", raw, edit_id
+
+    rate_f = parse_positive_number(rate)
+    if rate_f is None:
+        return gr.update(value=display), "⚠️ 匯率必須是有效的正數字", raw, edit_id
+
+    if is_base_currency(currency_id):
+        return gr.update(value=display), "⚠️ 這個幣別是台幣本身，不需要登記匯率", raw, edit_id
+
+    sql = """
+        INSERT INTO exchange_rates (currency_id, year, month, rate_to_twd)
+        VALUES (%s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE rate_to_twd = VALUES(rate_to_twd), recorded_at = CURRENT_TIMESTAMP
+    """
+    mycursor.execute(sql, (currency_id, int(year), int(month), rate_f))
+    mydb.commit()
+    msg = "✅ 匯率已登記"
+    display, raw = get_exchange_rate_list()
+    return gr.update(value=display), msg, raw, None
+
+
+def delete_exchange_rate(edit_id):
+    display, raw = get_exchange_rate_list()
+    if edit_id is None:
+        return gr.update(value=display), "⚠️ 請先在下方清單點選一筆資料再刪除", raw, edit_id
+    mycursor.execute("DELETE FROM exchange_rates WHERE id=%s", (edit_id,))
+    mydb.commit()
+    msg = "✅ 已刪除此筆匯率紀錄"
+    display, raw = get_exchange_rate_list()
+    return gr.update(value=display), msg, raw, None
+
+
+# ========== 儀表板 ==========
+
+def get_sales_total(year, month=None):
+    """出貨總額（假設全部都是台幣交易，不用換算）"""
+    if month is not None:
+        sql = "SELECT SUM(total_price) FROM sales WHERE YEAR(transaction_time)=%s AND MONTH(transaction_time)=%s"
+        params = (int(year), int(month))
+    else:
+        sql = "SELECT SUM(total_price) FROM sales WHERE YEAR(transaction_time)=%s"
+        params = (int(year),)
+    mycursor.execute(sql, params)
+    row = mycursor.fetchone()
+    return float(row[0]) if row[0] is not None else 0.0
+
+
+def get_purchases_total_twd(year, month=None):
+    """進貨總額換算成台幣；依每一筆交易當月的匯率換算，回傳 (總額, 使用估計匯率的幣別名稱集合)"""
+    if month is not None:
+        sql = """
+            SELECT MONTH(transaction_time) AS m, currency_id, SUM(total_price)
+            FROM purchases WHERE YEAR(transaction_time)=%s AND MONTH(transaction_time)=%s
+            GROUP BY MONTH(transaction_time), currency_id
+        """
+        params = (int(year), int(month))
+    else:
+        sql = """
+            SELECT MONTH(transaction_time) AS m, currency_id, SUM(total_price)
+            FROM purchases WHERE YEAR(transaction_time)=%s
+            GROUP BY MONTH(transaction_time), currency_id
+        """
+        params = (int(year),)
+    mycursor.execute(sql, params)
+    total = 0.0
+    estimated_currencies = set()
+    for m, currency_id, amt in mycursor.fetchall():
+        rate, is_estimated = get_exchange_rate(currency_id, year, m)
+        if is_estimated:
+            estimated_currencies.add(get_currency_name(currency_id))
+        total += float(amt) * rate
+    return total, estimated_currencies
+
+
+def get_expenses_total(year, month=None):
+    if month is not None:
+        sql = "SELECT SUM(amount) FROM monthly_expenses WHERE year=%s AND month=%s"
+        params = (int(year), int(month))
+    else:
+        sql = "SELECT SUM(amount) FROM monthly_expenses WHERE year=%s"
+        params = (int(year),)
+    mycursor.execute(sql, params)
+    row = mycursor.fetchone()
+    return float(row[0]) if row[0] is not None else 0.0
+
+
+def get_monthly_summary(year, month):
+    sales = get_sales_total(year, month)
+    purchases, estimated_currencies = get_purchases_total_twd(year, month)
+    gross = round(sales - purchases, 2)
+    expenses = get_expenses_total(year, month)
+    net = round(gross - expenses, 2)
+    return sales, purchases, gross, expenses, net, estimated_currencies
+
+
+def format_dashboard_summary(year, month):
+    sales, purchases, gross, expenses, net, estimated_currencies = get_monthly_summary(year, month)
+    warning = ""
+    if estimated_currencies:
+        names = "、".join(sorted(estimated_currencies))
+        warning = (
+            f"\n\n⚠️ 這個月的「{names}」還沒登記真實匯率，"
+            f"暫時用系統內建的大概匯率試算，數字僅供參考，請到「基礎資料設定 → 匯率」補上正確匯率後會自動改用真實數字。"
+        )
+    text = (
+        f"### {year} 年 {int(month):02d} 月 結算\n\n"
+        f"- 出貨總額：{sales:,.2f}\n"
+        f"- 進貨總額（已換算台幣）：{purchases:,.2f}\n"
+        f"- **毛利（出貨 - 進貨）：{gross:,.2f}**\n"
+        f"- 其他支出（薪水/租金等）：{expenses:,.2f}\n"
+        f"- **淨利（毛利 - 其他支出）：{net:,.2f}**"
+        f"{warning}"
+    )
+    return text
+
+
+def get_expenses_table(year, month):
+    sql = "SELECT id, item_name, amount FROM monthly_expenses WHERE year=%s AND month=%s ORDER BY id"
+    mycursor.execute(sql, (int(year), int(month)))
+    rows = mycursor.fetchall()
+    display_rows = [[name, float(amt)] for _, name, amt in rows]
+    raw_rows = [[rid, name, float(amt)] for rid, name, amt in rows]
+    return display_rows, raw_rows
+
+
+def refresh_dashboard(year, month):
+    summary_text = format_dashboard_summary(year, month)
+    display, raw = get_expenses_table(year, month)
+    return summary_text, gr.update(value=display), raw
+
+
+def select_expense_row(evt: gr.SelectData, raw_data):
+    row_idx = evt.index[0]
+    rid, name, amt = raw_data[row_idx]
+    return rid, name, str(amt), "已選取此筆支出，可以修改或刪除"
+
+
+def insert_expense(year, month, name, amount):
+    name = (name or "").strip()
+    display, raw = get_expenses_table(year, month)
+    if not name:
+        return format_dashboard_summary(year, month), gr.update(value=display), raw, "⚠️ 項目名稱不可空白", "", ""
+    amt_f = parse_positive_number(amount)
+    if amt_f is None:
+        return format_dashboard_summary(year, month), gr.update(value=display), raw, "⚠️ 金額必須是有效的數字", name, amount
+
+    mycursor.execute(
+        "INSERT INTO monthly_expenses (year, month, item_name, amount) VALUES (%s, %s, %s, %s)",
+        (int(year), int(month), name, amt_f),
+    )
+    mydb.commit()
+    display, raw = get_expenses_table(year, month)
+    return format_dashboard_summary(year, month), gr.update(value=display), raw, "✅ 新增成功", "", ""
+
+
+def update_expense(edit_id, year, month, name, amount):
+    name = (name or "").strip()
+    display, raw = get_expenses_table(year, month)
+    if edit_id is None:
+        return format_dashboard_summary(year, month), gr.update(value=display), raw, "⚠️ 請先選取一筆支出再修改", edit_id, name, amount
+    if not name:
+        return format_dashboard_summary(year, month), gr.update(value=display), raw, "⚠️ 項目名稱不可空白", edit_id, name, amount
+    amt_f = parse_positive_number(amount)
+    if amt_f is None:
+        return format_dashboard_summary(year, month), gr.update(value=display), raw, "⚠️ 金額必須是有效的數字", edit_id, name, amount
+
+    mycursor.execute(
+        "UPDATE monthly_expenses SET item_name=%s, amount=%s WHERE id=%s",
+        (name, amt_f, edit_id),
+    )
+    mydb.commit()
+    display, raw = get_expenses_table(year, month)
+    return format_dashboard_summary(year, month), gr.update(value=display), raw, "✅ 修改成功", None, "", ""
+
+
+def delete_expense(edit_id, year, month):
+    display, raw = get_expenses_table(year, month)
+    if edit_id is None:
+        return format_dashboard_summary(year, month), gr.update(value=display), raw, "⚠️ 請先選取一筆支出再刪除", edit_id, "", ""
+    mycursor.execute("DELETE FROM monthly_expenses WHERE id=%s", (edit_id,))
+    mydb.commit()
+    display, raw = get_expenses_table(year, month)
+    return format_dashboard_summary(year, month), gr.update(value=display), raw, "✅ 已刪除", None, "", ""
+
+
+def get_trend_periods(mode):
+    """依檢視模式回傳 (year, month_or_None, label) 的清單，由舊到新排序，方便畫圖"""
+    now = datetime.now()
+    periods = []
+    if mode == "近12個月":
+        y, m = now.year, now.month
+        for _ in range(12):
+            periods.append((y, m, f"{y}/{m:02d}"))
+            m -= 1
+            if m == 0:
+                m = 12
+                y -= 1
+        periods.reverse()
+    elif mode == "近5年":
+        for i in range(4, -1, -1):
+            y = now.year - i
+            periods.append((y, None, str(y)))
+    else:  # 近10年
+        for i in range(9, -1, -1):
+            y = now.year - i
+            periods.append((y, None, str(y)))
+    return periods
+
+
+def get_trend_chart_data(mode):
+    periods = get_trend_periods(mode)
+    rows = []
+    for y, m, label in periods:
+        sales, purchases, gross, expenses, net, _ = get_monthly_summary(y, m) if m else (
+            get_sales_total(y),
+            get_purchases_total_twd(y)[0],
+            None,
+            get_expenses_total(y),
+            None,
+            None,
+        )
+        if m:
+            gross_val, net_val = gross, net
+        else:
+            gross_val = round(sales - purchases, 2)
+            net_val = round(gross_val - expenses, 2)
+        rows.append({"期間": label, "類別": "出貨", "金額": sales})
+        rows.append({"期間": label, "類別": "進貨", "金額": purchases})
+        rows.append({"期間": label, "類別": "淨利", "金額": net_val})
+    return pd.DataFrame(rows)
+
+
+def refresh_trend_chart(mode):
+    return gr.update(value=get_trend_chart_data(mode))
+
+
+def refresh_dashboard_year_choices():
+    """點進『儀表板』分頁時，重新查一次年份選單，確保有最新一年可以選"""
+    year_months = get_inventory_year_months()
+    years = sorted({str(y) for y, m in year_months}, reverse=True)
+    if not years:
+        years = [str(datetime.now().year)]
+    return gr.update(choices=years)
+
+
 # ========== 基礎資料 ==========
 
 def get_basic_list(table):
@@ -820,6 +1165,80 @@ with gr.Blocks() as demo:
                     cur_msg = gr.Markdown("")
                     cur_list = gr.Dataframe(value=get_basic_list("currency"), headers=["ID", "名稱"], row_count=(1, "dynamic"), interactive=False)
 
+                with gr.TabItem("匯率"):
+                    gr.Markdown("登記每種幣別在每個年月對台幣的匯率（台幣本身不用登記，系統自動視為 1:1）。")
+                    fx_edit_id = gr.State(value=None)
+                    with gr.Row():
+                        fx_cur_dp = gr.Dropdown(choices=get_options("currency"), label="幣別", interactive=True)
+                        fx_year_tb = gr.Textbox(label="年份", placeholder="例如 2026")
+                        fx_month_tb = gr.Textbox(label="月份", placeholder="例如 09")
+                        fx_rate_tb = gr.Textbox(label="匯率（1 單位該幣別 = ？ 台幣）")
+                    with gr.Row():
+                        fx_save_btn = gr.Button("登記 / 更新匯率")
+                        fx_delete_btn = gr.Button("刪除此筆", variant="stop")
+                    fx_msg = gr.Markdown("")
+                    fx_display_init, fx_raw_init = get_exchange_rate_list()
+                    fx_list = gr.Dataframe(
+                        value=fx_display_init,
+                        headers=["幣別", "年份", "月份", "匯率"],
+                        row_count=(1, "dynamic"),
+                        interactive=False,
+                    )
+                    fx_raw_state = gr.State(value=fx_raw_init)
+
+        with gr.TabItem("儀表板", id="dashboard") as dashboard_tab:
+            gr.Markdown("月結損益總覽，以及出貨/進貨/淨利的走勢圖。")
+            with gr.Row():
+                dash_year_months = get_inventory_year_months()
+                if dash_year_months:
+                    dash_latest_year, dash_latest_month = dash_year_months[0]
+                else:
+                    now = datetime.now()
+                    dash_latest_year, dash_latest_month = now.year, now.month
+                dash_available_years = sorted({str(y) for y, m in dash_year_months}, reverse=True)
+                if not dash_available_years:
+                    dash_available_years = [str(dash_latest_year)]
+
+                dash_year_dp = gr.Dropdown(choices=dash_available_years, value=str(dash_latest_year), label="年份", interactive=True)
+                dash_month_dp = gr.Dropdown(
+                    choices=[f"{m:02d}" for m in range(1, 13)],
+                    value=f"{dash_latest_month:02d}",
+                    label="月份",
+                    interactive=True,
+                )
+                dash_query_btn = gr.Button("查詢")
+
+            dash_summary = gr.Markdown(format_dashboard_summary(str(dash_latest_year), f"{dash_latest_month:02d}"))
+
+            gr.Markdown("<h4 style='margin-top: 20px;'>本月其他支出（薪水、租金等）</h4>")
+            expense_edit_id = gr.State(value=None)
+            with gr.Row():
+                expense_name_tb = gr.Textbox(label="項目名稱", scale=2)
+                expense_amount_tb = gr.Textbox(label="金額", scale=1)
+            with gr.Row():
+                expense_add_btn = gr.Button("新增支出")
+                expense_update_btn = gr.Button("修改所選")
+                expense_delete_btn = gr.Button("刪除所選", variant="stop")
+            expense_msg = gr.Markdown("")
+            expense_display_init, expense_raw_init = get_expenses_table(str(dash_latest_year), f"{dash_latest_month:02d}")
+            expense_table = gr.Dataframe(
+                value=expense_display_init,
+                headers=["項目", "金額"],
+                row_count=(1, "dynamic"),
+                interactive=False,
+            )
+            expense_raw_state = gr.State(value=expense_raw_init)
+
+            gr.Markdown("<h4 style='margin-top: 30px;'>走勢圖</h4>")
+            trend_mode_dp = gr.Radio(choices=["近12個月", "近5年", "近10年"], value="近12個月", label="檢視方式")
+            trend_chart = gr.LinePlot(
+                value=get_trend_chart_data("近12個月"),
+                x="期間",
+                y="金額",
+                color="類別",
+                height=350,
+            )
+
     # ---------- 進貨 ----------
     insert.click(
         fn=insert_purchas,
@@ -920,6 +1339,52 @@ with gr.Blocks() as demo:
     cur_list.select(fn=select_basic_row, inputs=cur_list, outputs=[cur_edit_id, cur_name, cur_msg])
     cur_update_btn.click(fn=update_currency, inputs=[cur_edit_id, cur_name], outputs=[cur_list, cur_edit_id, cur_name, cur_msg])
     cur_delete_btn.click(fn=delete_currency, inputs=cur_edit_id, outputs=[cur_list, cur_edit_id, cur_name, cur_msg])
+
+    # ---------- 基礎資料：匯率 ----------
+    fx_list.select(
+        fn=select_exchange_rate_row,
+        inputs=fx_raw_state,
+        outputs=[fx_edit_id, fx_cur_dp, fx_year_tb, fx_month_tb, fx_rate_tb, fx_msg],
+    )
+    fx_save_btn.click(
+        fn=save_exchange_rate,
+        inputs=[fx_edit_id, fx_cur_dp, fx_year_tb, fx_month_tb, fx_rate_tb],
+        outputs=[fx_list, fx_msg, fx_raw_state, fx_edit_id],
+    )
+    fx_delete_btn.click(
+        fn=delete_exchange_rate,
+        inputs=fx_edit_id,
+        outputs=[fx_list, fx_msg, fx_raw_state, fx_edit_id],
+    )
+
+    # ---------- 儀表板 ----------
+    dash_query_btn.click(
+        fn=refresh_dashboard,
+        inputs=[dash_year_dp, dash_month_dp],
+        outputs=[dash_summary, expense_table, expense_raw_state],
+    )
+    expense_table.select(
+        fn=select_expense_row,
+        inputs=expense_raw_state,
+        outputs=[expense_edit_id, expense_name_tb, expense_amount_tb, expense_msg],
+    )
+    expense_add_btn.click(
+        fn=insert_expense,
+        inputs=[dash_year_dp, dash_month_dp, expense_name_tb, expense_amount_tb],
+        outputs=[dash_summary, expense_table, expense_raw_state, expense_msg, expense_name_tb, expense_amount_tb],
+    )
+    expense_update_btn.click(
+        fn=update_expense,
+        inputs=[expense_edit_id, dash_year_dp, dash_month_dp, expense_name_tb, expense_amount_tb],
+        outputs=[dash_summary, expense_table, expense_raw_state, expense_msg, expense_edit_id, expense_name_tb, expense_amount_tb],
+    )
+    expense_delete_btn.click(
+        fn=delete_expense,
+        inputs=[expense_edit_id, dash_year_dp, dash_month_dp],
+        outputs=[dash_summary, expense_table, expense_raw_state, expense_msg, expense_edit_id, expense_name_tb, expense_amount_tb],
+    )
+    trend_mode_dp.change(fn=refresh_trend_chart, inputs=trend_mode_dp, outputs=trend_chart)
+    dashboard_tab.select(fn=refresh_dashboard_year_choices, outputs=dash_year_dp)
 
     # ---------- 進貨/出貨/庫存分頁：每次點進去都重新查一次下拉選單 ----------
     purchases_tab.select(fn=refresh_purchase_dropdowns, outputs=[sup_dp, pro_dp, Cur_dp])
