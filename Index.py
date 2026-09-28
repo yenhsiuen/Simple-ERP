@@ -371,6 +371,69 @@ def get_actual_counts(year, month):
     return {(pid, unit): float(qty) for pid, unit, qty in mycursor.fetchall()}
 
 
+def has_inventory_counts(year, month):
+    """判斷該月是否至少登記過一筆實際盤點，供走勢圖區分「未盤點」和「死傷為零」。"""
+    mycursor.execute(
+        "SELECT 1 FROM inventory_counts WHERE year=%s AND month=%s LIMIT 1",
+        (int(year), int(month)),
+    )
+    return mycursor.fetchone() is not None
+
+
+def get_inventory_loss_summary(year, month):
+    """回傳某月盤點死傷的 (公斤, 台幣估值)。
+
+    只納入單位為「公斤」且實際盤點低於理論庫存的正向差額；
+    「隻」不計入死傷趨勢與估值。公斤死傷以截至該月底的加權平均進貨成本估值。
+    """
+    theoretical = {(pid, unit): qty for pid, unit, _name, qty in get_theoretical_inventory(year, month)}
+    actual = get_actual_counts(year, month)
+    if not actual:
+        return 0.0, 0.0
+
+    cutoff = get_month_cutoff(year, month)
+    mycursor.execute(
+        """
+        SELECT id, product_id, unit, currency_id, total_price, quantity,
+               YEAR(transaction_time), MONTH(transaction_time)
+        FROM purchases
+        WHERE transaction_time < %s AND quantity > 0
+        """,
+        (cutoff,),
+    )
+    cost_sum, qty_sum = {}, {}
+    for purchase_id, product_id, unit, currency_id, total_price, quantity, p_year, p_month in mycursor.fetchall():
+        twd, _is_estimated = get_purchase_twd_value(
+            purchase_id, currency_id, total_price, p_year, p_month
+        )
+        key = (product_id, unit)
+        cost_sum[key] = cost_sum.get(key, 0.0) + twd
+        qty_sum[key] = qty_sum.get(key, 0.0) + float(quantity)
+
+    loss_kg = 0.0
+    loss_twd = 0.0
+    for key, actual_qty in actual.items():
+        if key[1] != "公斤":
+            continue
+        loss_qty = theoretical.get(key, 0.0) - actual_qty
+        if loss_qty <= 0 or qty_sum.get(key, 0.0) <= 0:
+            continue
+        average_cost = cost_sum[key] / qty_sum[key]
+        loss_kg += loss_qty
+        loss_twd += loss_qty * average_cost
+    return round(loss_kg, 2), round(loss_twd, 2)
+
+
+def get_yearly_inventory_loss_summary(year):
+    """加總該年各月份已有盤點資料的死傷公斤與估值。"""
+    mycursor.execute(
+        "SELECT DISTINCT month FROM inventory_counts WHERE year=%s ORDER BY month",
+        (int(year),),
+    )
+    totals = [get_inventory_loss_summary(year, month) for (month,) in mycursor.fetchall()]
+    return round(sum(item[0] for item in totals), 2), round(sum(item[1] for item in totals), 2)
+
+
 def get_inventory_table(year, month):
     """組合理論庫存與實際盤點，回傳畫面顯示用的表格，以及修改/刪除用的原始資料"""
     theoretical_list = get_theoretical_inventory(year, month)
@@ -659,6 +722,7 @@ def get_monthly_summary(year, month):
 
 def format_dashboard_summary(year, month):
     sales, purchases, gross, expenses, net, estimated_currencies = get_monthly_summary(year, month)
+    inventory_loss_kg, inventory_loss_twd = get_inventory_loss_summary(year, month)
     warning = ""
     if estimated_currencies:
         names = "、".join(sorted(estimated_currencies))
@@ -671,6 +735,7 @@ def format_dashboard_summary(year, month):
         f"- 出貨總額：{sales:,.2f}\n"
         f"- 進貨總額（已換算台幣）：{purchases:,.2f}\n"
         f"- **毛利（出貨 - 進貨）：{gross:,.2f}**\n"
+        f"- 盤點死傷（僅公斤、已盤點且短少）：{inventory_loss_kg:,.2f} 公斤（估值 {inventory_loss_twd:,.2f} 元）\n"
         f"- 其他支出（薪水/租金等）：{expenses:,.2f}\n"
         f"- **淨利（毛利 - 其他支出）：{net:,.2f}**"
         f"{warning}"
@@ -785,17 +850,59 @@ def get_trend_chart_data(mode):
         )
         if m:
             gross_val, net_val = gross, net
+            # 未盤點的月份不畫成 0，避免誤解為「沒有死傷」。
+            loss_kg, loss_val = get_inventory_loss_summary(y, m) if has_inventory_counts(y, m) else (None, None)
         else:
             gross_val = round(sales - purchases, 2)
             net_val = round(gross_val - expenses, 2)
+            loss_kg, loss_val = get_yearly_inventory_loss_summary(y)
         rows.append({"期間": label, "類別": "出貨", "金額": sales})
         rows.append({"期間": label, "類別": "進貨", "金額": purchases})
+        rows.append({"期間": label, "類別": "毛利", "金額": gross_val})
         rows.append({"期間": label, "類別": "淨利", "金額": net_val})
+        rows.append({"期間": label, "類別": "死傷估值", "金額": loss_val})
     return pd.DataFrame(rows)
 
 
-def refresh_trend_chart(mode):
-    return gr.update(value=get_trend_chart_data(mode))
+def get_inventory_loss_trend_data(mode):
+    """死傷數量趨勢只顯示公斤，與台幣金額趨勢分開繪製。"""
+    rows = []
+    for y, m, label in get_trend_periods(mode):
+        if m:
+            loss_kg = get_inventory_loss_summary(y, m)[0] if has_inventory_counts(y, m) else None
+        else:
+            loss_kg = get_yearly_inventory_loss_summary(y)[0]
+        rows.append({"期間": label, "類別": "死傷（公斤）", "公斤": loss_kg})
+    return pd.DataFrame(rows)
+
+
+LOSS_KG_LABEL = "死傷（公斤）"
+
+
+def refresh_trend_chart(mode, selected):
+    """切換檢視方式時重新查一次資料，並依目前勾選的線條過濾後畫出來。
+    完整資料也存進 State，之後只勾選/取消勾選時不用再查資料庫。"""
+    main_df = get_trend_chart_data(mode)
+    loss_df = get_inventory_loss_trend_data(mode)
+    selected = selected or []
+    return (
+        gr.update(value=main_df[main_df["類別"].isin(selected)]),
+        gr.update(value=loss_df),
+        gr.update(visible=LOSS_KG_LABEL in selected),
+        main_df,
+        loss_df,
+    )
+
+
+def apply_trend_filter(selected, main_df, loss_df):
+    """勾選/取消勾選線條時，直接用已經算好的資料過濾，不用重新查資料庫"""
+    if main_df is None:
+        return gr.update(), gr.update()
+    selected = selected or []
+    return (
+        gr.update(value=main_df[main_df["類別"].isin(selected)]),
+        gr.update(visible=LOSS_KG_LABEL in selected),
+    )
 
 
 def refresh_dashboard_year_choices():
@@ -1577,7 +1684,10 @@ with gr.Blocks() as demo:
                     fx_raw_state = gr.State(value=fx_raw_init)
 
         with gr.TabItem("儀表板", id="dashboard") as dashboard_tab:
-            gr.Markdown("月結損益總覽，以及出貨/進貨/淨利的走勢圖。")
+            gr.Markdown(
+                "月結損益總覽與趨勢圖。走勢圖金額均為台幣，包含出貨、進貨、毛利、淨利及盤點死傷估值；"
+                "死傷僅統計已登記實際盤點且庫存短少的品項。"
+            )
             with gr.Row():
                 dash_year_months = get_inventory_year_months()
                 if dash_year_months:
@@ -1621,13 +1731,31 @@ with gr.Blocks() as demo:
 
             gr.Markdown("<h4 style='margin-top: 30px;'>走勢圖</h4>")
             trend_mode_dp = gr.Radio(choices=["近12個月", "近5年", "近10年"], value="近12個月", label="檢視方式")
+            trend_series_cbg = gr.CheckboxGroup(
+                choices=["出貨", "進貨", "毛利", "淨利", "死傷估值", "死傷（公斤）"],
+                value=["出貨", "進貨", "毛利", "淨利", "死傷估值", "死傷（公斤）"],
+                label="顯示哪些線條",
+            )
+            trend_main_init = get_trend_chart_data("近12個月")
+            trend_loss_init = get_inventory_loss_trend_data("近12個月")
+            trend_main_state = gr.State(value=trend_main_init)
+            trend_loss_state = gr.State(value=trend_loss_init)
             trend_chart = gr.LinePlot(
-                value=get_trend_chart_data("近12個月"),
+                value=trend_main_init,
                 x="期間",
                 y="金額",
                 color="類別",
                 height=350,
             )
+            with gr.Column(visible=True) as loss_chart_box:
+                gr.Markdown("#### 死傷數量趨勢（僅公斤）")
+                loss_trend_chart = gr.LinePlot(
+                    value=trend_loss_init,
+                    x="期間",
+                    y="公斤",
+                    color="類別",
+                    height=250,
+                )
 
         with gr.TabItem("應收/應付帳款", id="receivable_payable") as receivable_payable_tab:
             with gr.Tabs():
@@ -1854,7 +1982,16 @@ with gr.Blocks() as demo:
         inputs=[expense_edit_id, dash_year_dp, dash_month_dp],
         outputs=[dash_summary, expense_table, expense_raw_state, expense_msg, expense_edit_id, expense_name_tb, expense_amount_tb],
     )
-    trend_mode_dp.change(fn=refresh_trend_chart, inputs=trend_mode_dp, outputs=trend_chart)
+    trend_mode_dp.change(
+        fn=refresh_trend_chart,
+        inputs=[trend_mode_dp, trend_series_cbg],
+        outputs=[trend_chart, loss_trend_chart, loss_chart_box, trend_main_state, trend_loss_state],
+    )
+    trend_series_cbg.change(
+        fn=apply_trend_filter,
+        inputs=[trend_series_cbg, trend_main_state, trend_loss_state],
+        outputs=[trend_chart, loss_chart_box],
+    )
     dashboard_tab.select(fn=refresh_dashboard_year_choices, outputs=dash_year_dp)
 
     # ---------- 進貨/出貨/庫存分頁：每次點進去都重新查一次下拉選單 ----------
