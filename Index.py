@@ -610,29 +610,29 @@ def get_sales_total(year, month=None):
 
 
 def get_purchases_total_twd(year, month=None):
-    """進貨總額換算成台幣；依每一筆交易當月的匯率換算，回傳 (總額, 使用估計匯率的幣別名稱集合)"""
+    """進貨總額換算成台幣。每一筆優先使用『已透過應付帳款實際分配』換算出來的台幣金額
+    （來自實際匯款反推的真實匯率），沒有分配過的才用該月的登記/估計匯率去算。
+    回傳 (總額, 使用估計匯率的幣別名稱集合)"""
     if month is not None:
         sql = """
-            SELECT MONTH(transaction_time) AS m, currency_id, SUM(total_price)
+            SELECT id, currency_id, total_price, MONTH(transaction_time) AS m
             FROM purchases WHERE YEAR(transaction_time)=%s AND MONTH(transaction_time)=%s
-            GROUP BY MONTH(transaction_time), currency_id
         """
         params = (int(year), int(month))
     else:
         sql = """
-            SELECT MONTH(transaction_time) AS m, currency_id, SUM(total_price)
+            SELECT id, currency_id, total_price, MONTH(transaction_time) AS m
             FROM purchases WHERE YEAR(transaction_time)=%s
-            GROUP BY MONTH(transaction_time), currency_id
         """
         params = (int(year),)
     mycursor.execute(sql, params)
     total = 0.0
     estimated_currencies = set()
-    for m, currency_id, amt in mycursor.fetchall():
-        rate, is_estimated = get_exchange_rate(currency_id, year, m)
+    for pid, currency_id, amt, m in mycursor.fetchall():
+        twd, is_estimated = get_purchase_twd_value(pid, currency_id, amt, year, m)
         if is_estimated:
             estimated_currencies.add(get_currency_name(currency_id))
-        total += float(amt) * rate
+        total += twd
     return total, estimated_currencies
 
 
@@ -928,18 +928,35 @@ def refresh_receivable_customer_dropdown():
 
 # ========== 應付帳款 ==========
 
+def get_purchase_twd_value(purchase_id, currency_id, total_price, year, month):
+    """單筆進貨的台幣價值：優先用『實際分配過的付款』換算出來的台幣金額，
+    沒有分配過的才用該月的登記/估計匯率去算"""
+    mycursor.execute("SELECT twd_amount FROM payable_payment_allocations WHERE purchase_id=%s", (purchase_id,))
+    row = mycursor.fetchone()
+    if row:
+        return float(row[0]), False
+    rate, is_estimated = get_exchange_rate(currency_id, year, month)
+    return float(total_price) * rate, is_estimated
+
+
 def get_supplier_balances():
-    """每個廠商：累計進貨總額、累計已付金額、應付餘額"""
-    mycursor.execute("SELECT supplier_id, SUM(total_price) FROM purchases GROUP BY supplier_id")
-    purchases_map = {sid: float(amt) for sid, amt in mycursor.fetchall()}
+    """每個廠商：累計進貨總額（換算台幣）、累計已付金額（台幣）、應付餘額（台幣）"""
+    mycursor.execute("SELECT id, supplier_id, currency_id, total_price, YEAR(transaction_time), MONTH(transaction_time) FROM purchases")
+    purchase_rows = mycursor.fetchall()
+
+    purchase_twd_map = {}
+    for pid, sid, currency_id, total_price, y, m in purchase_rows:
+        twd, _ = get_purchase_twd_value(pid, currency_id, total_price, y, m)
+        purchase_twd_map[sid] = purchase_twd_map.get(sid, 0.0) + twd
+
     mycursor.execute("SELECT supplier_id, SUM(amount) FROM payable_payments GROUP BY supplier_id")
     paid_map = {sid: float(amt) for sid, amt in mycursor.fetchall()}
     mycursor.execute("SELECT id, name FROM suppliers")
     name_map = {sid: name for sid, name in mycursor.fetchall()}
 
     rows = []
-    for sid in set(purchases_map) | set(paid_map):
-        total = purchases_map.get(sid, 0.0)
+    for sid in set(purchase_twd_map) | set(paid_map):
+        total = round(purchase_twd_map.get(sid, 0.0), 2)
         paid = paid_map.get(sid, 0.0)
         rows.append([name_map.get(sid, f"(未知廠商 #{sid})"), total, paid, round(total - paid, 2)])
     rows.sort(key=lambda r: r[0])
@@ -948,17 +965,44 @@ def get_supplier_balances():
 
 def get_payable_payments_list():
     sql = """
-        SELECT pp.id, s.name, pp.payment_date, pp.amount, pp.note, pp.supplier_id
+        SELECT pp.id, s.name, pp.payment_date, pp.amount, pp.exchange_rate, pp.note, pp.supplier_id,
+               GROUP_CONCAT(DISTINCT cur.name ORDER BY cur.name SEPARATOR ', ') AS currency_names,
+               SUM(ppa.original_amount) AS foreign_total
         FROM payable_payments pp
         LEFT JOIN suppliers s ON pp.supplier_id = s.id
+        LEFT JOIN payable_payment_allocations ppa ON ppa.payment_id = pp.id
+        LEFT JOIN purchases pu ON ppa.purchase_id = pu.id
+        LEFT JOIN currency cur ON pu.currency_id = cur.id
+        GROUP BY pp.id, s.name, pp.payment_date, pp.amount, pp.exchange_rate, pp.note, pp.supplier_id
         ORDER BY pp.payment_date DESC, pp.id DESC
     """
     mycursor.execute(sql)
     display_rows, raw_rows = [], []
-    for rid, sname, pdate, amount, note, supplier_id in mycursor.fetchall():
-        display_rows.append([sname, str(pdate), float(amount), note or ""])
+    for rid, sname, pdate, amount, rate, note, supplier_id, currencies, foreign_total in mycursor.fetchall():
+        rate_disp = round(float(rate), 4) if rate is not None else "-"
+        currency_disp = currencies or "未分配（舊資料）"
+        foreign_disp = round(float(foreign_total), 2) if foreign_total is not None else "-"
+        display_rows.append([sname, str(pdate), currency_disp, foreign_disp, float(amount), rate_disp, note or ""])
         raw_rows.append([rid, supplier_id, str(pdate), float(amount), note or ""])
     return display_rows, raw_rows
+
+
+def get_payment_allocation_detail(payment_id):
+    """查某一筆付款分配到了哪些進貨紀錄，供點選付款紀錄時顯示明細"""
+    if payment_id is None:
+        return []
+    sql = """
+        SELECT pu.transaction_time, p.name, ppa.original_amount, cur.name, ppa.effective_rate, ppa.twd_amount
+        FROM payable_payment_allocations ppa
+        LEFT JOIN purchases pu ON ppa.purchase_id = pu.id
+        LEFT JOIN products p ON pu.product_id = p.id
+        LEFT JOIN currency cur ON pu.currency_id = cur.id
+        WHERE ppa.payment_id = %s
+        ORDER BY pu.transaction_time
+    """
+    mycursor.execute(sql, (payment_id,))
+    return [[str(t), pname, float(amt), cname, round(float(rate), 4), float(twd)]
+            for t, pname, amt, cname, rate, twd in mycursor.fetchall()]
 
 
 def refresh_payable_page():
@@ -970,66 +1014,183 @@ def refresh_payable_page():
 def select_payable_row(evt: gr.SelectData, raw_data):
     row_idx = evt.index[0]
     rid, supplier_id, pdate, amount, note = raw_data[row_idx]
-    msg = "已選取此筆付款紀錄，可以修改或刪除"
-    return rid, gr.update(value=supplier_id), pdate, str(amount), note, msg
+    detail = get_payment_allocation_detail(rid)
+    if detail:
+        msg = "已選取此筆付款紀錄，下方顯示這筆付款分配到的進貨明細（此類付款只能刪除，不能修改）"
+    else:
+        msg = "已選取此筆付款紀錄，可以刪除"
+    return rid, gr.update(value=detail), msg
 
 
-def insert_payable_payment(supplier_id, pdate, amount, note):
+def get_unallocated_payment_currencies(supplier_id):
+    """列出某廠商仍有未付款進貨的幣別；一次付款只能處理一個幣別。"""
+    if not supplier_id:
+        return []
+    sql = """
+        SELECT DISTINCT cur.id, cur.name
+        FROM purchases pu
+        LEFT JOIN currency cur ON pu.currency_id = cur.id
+        WHERE pu.supplier_id = %s
+          AND NOT EXISTS (
+              SELECT 1 FROM payable_payment_allocations ppa WHERE ppa.purchase_id = pu.id
+          )
+        ORDER BY cur.name
+    """
+    mycursor.execute(sql, (supplier_id,))
+    return [(name or f"幣別 #{currency_id}", currency_id) for currency_id, name in mycursor.fetchall()]
+
+
+def get_unallocated_purchases(supplier_id, currency_id):
+    """某廠商、某幣別還沒被分配過的進貨紀錄。"""
+    if not supplier_id or not currency_id:
+        return []
+    sql = """
+        SELECT pu.id, pu.transaction_time, p.name, pu.quantity, pu.unit, pu.total_price, cur.name
+        FROM purchases pu
+        LEFT JOIN products p ON pu.product_id = p.id
+        LEFT JOIN currency cur ON pu.currency_id = cur.id
+        WHERE pu.supplier_id = %s
+          AND pu.currency_id = %s
+          AND NOT EXISTS (
+              SELECT 1 FROM payable_payment_allocations ppa WHERE ppa.purchase_id = pu.id
+          )
+        ORDER BY pu.transaction_time
+    """
+    mycursor.execute(sql, (supplier_id, currency_id))
+    return mycursor.fetchall()
+
+
+def refresh_payment_currency_choices(supplier_id):
+    choices = get_unallocated_payment_currencies(supplier_id)
+    hint = "請先選擇付款幣別，再勾選要合併付款的進貨。" if choices else "此廠商目前沒有尚未分配的進貨紀錄。"
+    return gr.update(choices=choices, value=None), gr.update(choices=[], value=[]), hint
+
+
+def refresh_unallocated_choices(supplier_id, currency_id):
+    rows = get_unallocated_purchases(supplier_id, currency_id)
+    choices = []
+    for pid, tdate, pname, qty, unit, total, cname in rows:
+        label = f"{tdate}｜{pname}｜{qty}{unit}｜{float(total):,.2f} {cname}"
+        choices.append((label, pid))
+    currency_name = get_currency_name(currency_id) if currency_id else ""
+    hint = f"請勾選本次要付款的 {currency_name} 進貨紀錄。" if choices else "此幣別沒有尚未分配的進貨紀錄。"
+    return gr.update(choices=choices, value=[]), hint
+
+
+def preview_payable_payment(supplier_id, currency_id, selected_ids, twd_total):
+    """在真正寫入前顯示本次付款會使用的匯率與外幣合計。"""
+    if not supplier_id:
+        return "請先選擇廠商。"
+    if not currency_id:
+        return "請選擇本次付款的幣別。"
+    if not selected_ids:
+        return "請勾選要合併付款的進貨紀錄。"
+    placeholders = ",".join(["%s"] * len(selected_ids))
+    sql = f"""
+        SELECT COUNT(*), COALESCE(SUM(total_price), 0)
+        FROM purchases
+        WHERE supplier_id=%s AND currency_id=%s AND id IN ({placeholders})
+    """
+    mycursor.execute(sql, (supplier_id, currency_id, *selected_ids))
+    count, foreign_total = mycursor.fetchone()
+    currency_name = get_currency_name(currency_id)
+    foreign_total = float(foreign_total)
+    twd_f = parse_positive_number(twd_total)
+    if twd_f is None:
+        return f"已選 {count} 筆｜待付合計：**{foreign_total:,.2f} {currency_name}**。請輸入實際匯出的台幣總額以試算匯率。"
+    rate = twd_f / foreign_total if foreign_total else 0
+    return (
+        f"已選 {count} 筆｜外幣合計：**{foreign_total:,.2f} {currency_name}** ｜"
+        f"實際匯出：**NT$ {twd_f:,.2f}** ｜實際匯率：**1 {currency_name} = NT$ {rate:,.4f}**"
+    )
+
+
+def insert_payable_payment(supplier_id, currency_id, pdate, twd_total, selected_ids, note):
     balance_display = get_supplier_balances()
     payment_display, payment_raw = get_payable_payments_list()
+    empty_alloc = []
+
     if not supplier_id:
-        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 請選擇廠商"
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 請選擇廠商", gr.update(), gr.update(), empty_alloc, "請先選擇廠商。"
+    if not currency_id:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 請選擇本次付款幣別", gr.update(), gr.update(), empty_alloc, "請選擇本次付款的幣別。"
     date_ok = parse_date_str(pdate)
     if date_ok is None:
-        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 日期格式必須是 YYYY-MM-DD"
-    amt_f = parse_positive_number(amount)
-    if amt_f is None:
-        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 金額必須是有效的數字"
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 日期格式必須是 YYYY-MM-DD", gr.update(), gr.update(), empty_alloc, preview_payable_payment(supplier_id, currency_id, selected_ids, twd_total)
+    twd_f = parse_positive_number(twd_total)
+    if twd_f is None:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 台幣總額必須是有效的數字", gr.update(), gr.update(), empty_alloc, preview_payable_payment(supplier_id, currency_id, selected_ids, twd_total)
+    if not selected_ids:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 請至少勾選一筆要涵蓋的進貨紀錄", gr.update(), gr.update(), empty_alloc, "請勾選至少一筆進貨紀錄。"
+
+    placeholders = ",".join(["%s"] * len(selected_ids))
+    mycursor.execute(
+        f"""
+        SELECT pu.id, pu.total_price
+        FROM purchases pu
+        WHERE pu.supplier_id=%s AND pu.currency_id=%s AND pu.id IN ({placeholders})
+          AND NOT EXISTS (SELECT 1 FROM payable_payment_allocations ppa WHERE ppa.purchase_id=pu.id)
+        """,
+        (supplier_id, currency_id, *selected_ids),
+    )
+    rows = sorted(mycursor.fetchall(), key=lambda r: r[0])
+    if len(rows) != len(selected_ids):
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 選取資料已變更，請重新選擇要付款的進貨紀錄", gr.update(), gr.update(), empty_alloc, "請重新選擇要付款的進貨紀錄。"
+    foreign_total = sum(float(r[1]) for r in rows)
+    if foreign_total <= 0:
+        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 選取的進貨金額加總異常", gr.update(), gr.update(), empty_alloc, "無法計算匯率。"
+
+    effective_rate = twd_f / foreign_total
 
     mycursor.execute(
-        "INSERT INTO payable_payments (supplier_id, payment_date, amount, note) VALUES (%s, %s, %s, %s)",
-        (supplier_id, date_ok, amt_f, (note or "").strip() or None),
+        "INSERT INTO payable_payments (supplier_id, payment_date, amount, exchange_rate, note) VALUES (%s, %s, %s, %s, %s)",
+        (supplier_id, date_ok, twd_f, round(effective_rate, 4), (note or "").strip() or None),
     )
+    payment_id = mycursor.lastrowid
+
+    allocated_sum = 0.0
+    for i, (pid, original_amount) in enumerate(rows):
+        if i == len(rows) - 1:
+            twd_amount = round(twd_f - allocated_sum, 2)  # 最後一筆補齊差額，避免四捨五入誤差
+        else:
+            twd_amount = round(float(original_amount) * effective_rate, 2)
+            allocated_sum += twd_amount
+        mycursor.execute(
+            "INSERT INTO payable_payment_allocations (payment_id, purchase_id, original_amount, twd_amount, effective_rate) VALUES (%s, %s, %s, %s, %s)",
+            (payment_id, pid, float(original_amount), twd_amount, round(effective_rate, 4)),
+        )
     mydb.commit()
+
     balance_display = get_supplier_balances()
     payment_display, payment_raw = get_payable_payments_list()
-    return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "✅ 新增成功"
+    msg = f"✅ 登記成功，這次反推出的實際匯率約為 {effective_rate:.4f}，共分配到 {len(rows)} 筆進貨"
+    return (
+        gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, msg,
+        gr.update(value=None), gr.update(choices=[], value=[]), empty_alloc,
+        "付款已登記；請重新選擇下一次付款的廠商與幣別。"
+    )
 
 
-def update_payable_payment(edit_id, supplier_id, pdate, amount, note):
+def delete_payable_payment(edit_id, supplier_id, currency_id):
     balance_display = get_supplier_balances()
     payment_display, payment_raw = get_payable_payments_list()
     if edit_id is None:
-        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 請先選取一筆紀錄再修改", edit_id
-    if not supplier_id:
-        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 請選擇廠商", edit_id
-    date_ok = parse_date_str(pdate)
-    if date_ok is None:
-        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 日期格式必須是 YYYY-MM-DD", edit_id
-    amt_f = parse_positive_number(amount)
-    if amt_f is None:
-        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 金額必須是有效的數字", edit_id
-
-    mycursor.execute(
-        "UPDATE payable_payments SET supplier_id=%s, payment_date=%s, amount=%s, note=%s WHERE id=%s",
-        (supplier_id, date_ok, amt_f, (note or "").strip() or None, edit_id),
-    )
-    mydb.commit()
-    balance_display = get_supplier_balances()
-    payment_display, payment_raw = get_payable_payments_list()
-    return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "✅ 修改成功", None
-
-
-def delete_payable_payment(edit_id):
-    balance_display = get_supplier_balances()
-    payment_display, payment_raw = get_payable_payments_list()
-    if edit_id is None:
-        return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "⚠️ 請先選取一筆紀錄再刪除", edit_id
+        return (
+            gr.update(value=balance_display), gr.update(value=payment_display), payment_raw,
+            "⚠️ 請先選取一筆紀錄再刪除", edit_id, [], gr.update(),
+            preview_payable_payment(supplier_id, currency_id, [], "")
+        )
+    # payable_payment_allocations 設了 ON DELETE CASCADE，刪除付款會自動一併刪除分配明細，
+    # 被涵蓋的那些進貨紀錄也會自動恢復成「尚未分配」狀態，可以重新勾選登記
     mycursor.execute("DELETE FROM payable_payments WHERE id=%s", (edit_id,))
     mydb.commit()
     balance_display = get_supplier_balances()
     payment_display, payment_raw = get_payable_payments_list()
-    return gr.update(value=balance_display), gr.update(value=payment_display), payment_raw, "✅ 已刪除", None
+    choices_update, hint = refresh_unallocated_choices(supplier_id, currency_id)
+    return (
+        gr.update(value=balance_display), gr.update(value=payment_display), payment_raw,
+        "✅ 已刪除，相關進貨紀錄已恢復成尚未分配", None, [], choices_update, hint
+    )
 
 
 def refresh_payable_supplier_dropdown():
@@ -1504,11 +1665,14 @@ with gr.Blocks() as demo:
                     rec_payment_raw_state = gr.State(value=rec_payment_raw_init)
 
                 with gr.TabItem("應付"):
-                    gr.Markdown("每個廠商累計進貨總額、已付金額，以及還沒付的應付款餘額。")
+                    gr.Markdown(
+                        "外幣付款請依序選擇：**廠商 → 本次付款幣別 → 未付款進貨 → 實際匯出台幣總額**。\n\n"
+                        "一次付款只能處理一種幣別，系統會反推單一實際匯率，並按原始外幣金額分攤到每筆進貨。"
+                    )
                     pay_balance_init = get_supplier_balances()
                     pay_balance_table = gr.Dataframe(
                         value=pay_balance_init,
-                        headers=["廠商", "累計進貨總額", "已付金額", "應付款餘額"],
+                        headers=["廠商", "累計進貨總額(台幣)", "已付金額(台幣)", "應付款餘額(台幣)"],
                         row_count=(1, "dynamic"),
                         interactive=False,
                     )
@@ -1516,25 +1680,35 @@ with gr.Blocks() as demo:
                     gr.Markdown("<h4 style='margin-top: 30px;'>登記付款</h4>")
                     pay_edit_id = gr.State(value=None)
                     with gr.Row():
-                        pay_sup_dp = gr.Dropdown(choices=get_options("suppliers"), label="廠商", interactive=True)
+                        pay_sup_dp = gr.Dropdown(choices=get_options("suppliers"), label="1. 廠商", interactive=True)
+                        pay_currency_dp = gr.Dropdown(choices=[], label="2. 本次付款幣別", interactive=True)
                         pay_date_tb = gr.Textbox(label="日期", value=datetime.now().strftime("%Y-%m-%d"))
-                        pay_amount_tb = gr.Textbox(label="付款金額")
+                        pay_amount_tb = gr.Textbox(label="4. 實際匯出台幣總額")
                         pay_note_tb = gr.Textbox(label="備註（選填）")
+                    pay_unalloc_cbg = gr.CheckboxGroup(choices=[], label="3. 勾選本次合併付款的未付款進貨")
+                    pay_preview = gr.Markdown("請依序選擇廠商、付款幣別與進貨紀錄。")
                     with gr.Row():
-                        pay_add_btn = gr.Button("新增付款")
-                        pay_update_btn = gr.Button("修改所選")
+                        pay_add_btn = gr.Button("計算並登記付款")
                         pay_delete_btn = gr.Button("刪除所選", variant="stop")
                     pay_msg = gr.Markdown("")
 
-                    gr.Markdown("<h4 style='margin-top: 20px;'>付款紀錄（點一列可選取來修改或刪除）</h4>")
+                    gr.Markdown("<h4 style='margin-top: 20px;'>付款紀錄（點一列可選取來刪除，下方會顯示分配明細）</h4>")
                     pay_payment_display_init, pay_payment_raw_init = get_payable_payments_list()
                     pay_payment_table = gr.Dataframe(
                         value=pay_payment_display_init,
-                        headers=["廠商", "日期", "金額", "備註"],
+                        headers=["廠商", "日期", "付款幣別", "外幣合計", "匯出台幣", "實際匯率", "備註"],
                         row_count=(1, "dynamic"),
                         interactive=False,
                     )
                     pay_payment_raw_state = gr.State(value=pay_payment_raw_init)
+
+                    gr.Markdown("<h4 style='margin-top: 20px;'>選取付款的分配明細</h4>")
+                    pay_allocation_table = gr.Dataframe(
+                        value=[],
+                        headers=["進貨日期", "貨品", "原始金額(外幣)", "幣別", "換算匯率", "台幣分攤金額"],
+                        row_count=(1, "dynamic"),
+                        interactive=False,
+                    )
 
     # ---------- 進貨 ----------
     insert.click(
@@ -1710,25 +1884,40 @@ with gr.Blocks() as demo:
     )
 
     # ---------- 應付帳款 ----------
+    pay_sup_dp.change(
+        fn=refresh_payment_currency_choices,
+        inputs=pay_sup_dp,
+        outputs=[pay_currency_dp, pay_unalloc_cbg, pay_preview],
+    )
+    pay_currency_dp.change(
+        fn=refresh_unallocated_choices,
+        inputs=[pay_sup_dp, pay_currency_dp],
+        outputs=[pay_unalloc_cbg, pay_preview],
+    )
+    pay_unalloc_cbg.change(
+        fn=preview_payable_payment,
+        inputs=[pay_sup_dp, pay_currency_dp, pay_unalloc_cbg, pay_amount_tb],
+        outputs=pay_preview,
+    )
+    pay_amount_tb.change(
+        fn=preview_payable_payment,
+        inputs=[pay_sup_dp, pay_currency_dp, pay_unalloc_cbg, pay_amount_tb],
+        outputs=pay_preview,
+    )
     pay_payment_table.select(
         fn=select_payable_row,
         inputs=pay_payment_raw_state,
-        outputs=[pay_edit_id, pay_sup_dp, pay_date_tb, pay_amount_tb, pay_note_tb, pay_msg],
+        outputs=[pay_edit_id, pay_allocation_table, pay_msg],
     )
     pay_add_btn.click(
         fn=insert_payable_payment,
-        inputs=[pay_sup_dp, pay_date_tb, pay_amount_tb, pay_note_tb],
-        outputs=[pay_balance_table, pay_payment_table, pay_payment_raw_state, pay_msg],
-    )
-    pay_update_btn.click(
-        fn=update_payable_payment,
-        inputs=[pay_edit_id, pay_sup_dp, pay_date_tb, pay_amount_tb, pay_note_tb],
-        outputs=[pay_balance_table, pay_payment_table, pay_payment_raw_state, pay_msg, pay_edit_id],
+        inputs=[pay_sup_dp, pay_currency_dp, pay_date_tb, pay_amount_tb, pay_unalloc_cbg, pay_note_tb],
+        outputs=[pay_balance_table, pay_payment_table, pay_payment_raw_state, pay_msg, pay_currency_dp, pay_unalloc_cbg, pay_allocation_table, pay_preview],
     )
     pay_delete_btn.click(
         fn=delete_payable_payment,
-        inputs=pay_edit_id,
-        outputs=[pay_balance_table, pay_payment_table, pay_payment_raw_state, pay_msg, pay_edit_id],
+        inputs=[pay_edit_id, pay_sup_dp, pay_currency_dp],
+        outputs=[pay_balance_table, pay_payment_table, pay_payment_raw_state, pay_msg, pay_edit_id, pay_allocation_table, pay_unalloc_cbg, pay_preview],
     )
 
     # ---------- 應收/應付帳款：每次點進這個分頁，重新查一次下拉選單跟表格 ----------
@@ -1740,20 +1929,24 @@ with gr.Blocks() as demo:
         return (
             gr.update(choices=get_options("customers")),
             gr.update(choices=get_options("suppliers")),
+            gr.update(choices=[], value=None),
             gr.update(value=rec_balance),
             gr.update(value=rec_payment_display),
             rec_payment_raw,
             gr.update(value=pay_balance),
             gr.update(value=pay_payment_display),
             pay_payment_raw,
+            gr.update(choices=[], value=[]),
+            "請依序選擇廠商、付款幣別與進貨紀錄。",
         )
 
     receivable_payable_tab.select(
         fn=refresh_receivable_payable_page,
         outputs=[
-            rec_cus_dp, pay_sup_dp,
+            rec_cus_dp, pay_sup_dp, pay_currency_dp,
             rec_balance_table, rec_payment_table, rec_payment_raw_state,
             pay_balance_table, pay_payment_table, pay_payment_raw_state,
+            pay_unalloc_cbg, pay_preview,
         ],
     )
 
