@@ -1,7 +1,12 @@
 import pymysql
 import gradio as gr
 import pandas as pd
+import os
+import tempfile
 from datetime import datetime
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 mydb = pymysql.connect(host="localhost", user="root", password="4567", database="川海erp")
 mycursor = mydb.cursor()
@@ -1450,13 +1455,477 @@ def auto_calculate_total(qty_str, price_str):
         return ""
 
 
+# ========== 匯出 ==========
+
+EXPORT_DIR = os.path.join(tempfile.gettempdir(), "川海erp_匯出")
+ALL_MONTHS_LABEL = "全年"
+MONEY_FORMAT = "#,##0.00"
+QTY_FORMAT = "#,##0.##"
+
+_thin = Side(style="thin", color="999999")
+CELL_BORDER = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
+HEADER_FILL = PatternFill("solid", fgColor="DDEBF7")
+
+
+def get_export_year_choices():
+    years = sorted({str(y) for y, m in get_inventory_year_months()}, reverse=True)
+    return years or [str(datetime.now().year)]
+
+
+def period_where(alias, year, month):
+    """依年份＋月份（或『全年』）組出 WHERE 條件與參數"""
+    if month == ALL_MONTHS_LABEL:
+        return f"YEAR({alias}.transaction_time) = %s", [int(year)]
+    return f"YEAR({alias}.transaction_time) = %s AND MONTH({alias}.transaction_time) = %s", [int(year), int(month)]
+
+
+def period_label(year, month):
+    return f"{year} 年" if month == ALL_MONTHS_LABEL else f"{year} 年 {int(month):02d} 月"
+
+
+def new_export_path(prefix):
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    return os.path.join(EXPORT_DIR, f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
+
+
+def write_table(ws, start_row, headers, rows, money_cols=(), qty_cols=()):
+    """從 start_row 開始寫一個有框線的表格，回傳下一個空白列的列號"""
+    for c, h in enumerate(headers, start=1):
+        cell = ws.cell(row=start_row, column=c, value=h)
+        cell.font = Font(bold=True)
+        cell.fill = HEADER_FILL
+        cell.border = CELL_BORDER
+        cell.alignment = Alignment(horizontal="center")
+    for r, row in enumerate(rows, start=start_row + 1):
+        for c, val in enumerate(row, start=1):
+            cell = ws.cell(row=r, column=c, value=val)
+            cell.border = CELL_BORDER
+            if c in money_cols:
+                cell.number_format = MONEY_FORMAT
+            elif c in qty_cols:
+                cell.number_format = QTY_FORMAT
+    return start_row + len(rows) + 1
+
+
+def autofit_columns(ws, min_width=8, max_width=40):
+    widths = {}
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is None:
+                continue
+            # 中文字大約佔兩個英文字寬
+            length = sum(2 if ord(ch) > 127 else 1 for ch in str(cell.value))
+            widths[cell.column] = max(widths.get(cell.column, 0), length)
+    for col, w in widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = max(min_width, min(max_width, w + 2))
+
+
+def write_title(ws, title, subtitle, ncols):
+    ws.cell(row=1, column=1, value=title).font = Font(bold=True, size=16)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
+    ws.cell(row=1, column=1).alignment = Alignment(horizontal="center")
+    ws.cell(row=2, column=1, value=subtitle)
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=ncols)
+
+
+def fmt_date(val):
+    return val.strftime("%Y-%m-%d") if hasattr(val, "strftime") else str(val)
+
+
+def export_sales_excel(year, month, customer_id):
+    where, params = period_where("sa", year, month)
+    if customer_id:
+        where += " AND sa.customer_id = %s"
+        params.append(customer_id)
+    mycursor.execute(f"""
+        SELECT sa.transaction_time, c.name, p.name, sa.quantity, sa.unit, sa.unit_price, sa.total_price
+        FROM sales sa
+        LEFT JOIN customers c ON sa.customer_id = c.id
+        LEFT JOIN products p ON sa.product_id = p.id
+        WHERE {where}
+        ORDER BY sa.transaction_time, sa.id
+    """, params)
+    rows = [[fmt_date(t), cname, pname, float(q), unit, float(up), float(tp)]
+            for t, cname, pname, q, unit, up, tp in mycursor.fetchall()]
+    if not rows:
+        return None, f"⚠️ {period_label(year, month)}沒有符合條件的出貨紀錄"
+
+    headers = ["日期", "客戶", "貨品", "數量", "單位", "單價", "總額"]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "出貨表"
+    write_title(ws, "川海 出貨表", f"期間：{period_label(year, month)}", len(headers))
+    next_row = write_table(ws, 4, headers, rows, money_cols=(6, 7), qty_cols=(4,))
+    ws.cell(row=next_row, column=6, value="合計").font = Font(bold=True)
+    total_cell = ws.cell(row=next_row, column=7, value=round(sum(r[6] for r in rows), 2))
+    total_cell.font = Font(bold=True)
+    total_cell.number_format = MONEY_FORMAT
+    autofit_columns(ws)
+
+    path = new_export_path(f"出貨表_{year}{'' if month == ALL_MONTHS_LABEL else month}")
+    wb.save(path)
+    return path, f"✅ 已產生出貨表，共 {len(rows)} 筆，請點下方檔案下載"
+
+
+def export_purchases_excel(year, month, supplier_id):
+    where, params = period_where("pu", year, month)
+    if supplier_id:
+        where += " AND pu.supplier_id = %s"
+        params.append(supplier_id)
+    mycursor.execute(f"""
+        SELECT pu.transaction_time, s.name, p.name, pu.quantity, pu.unit, pu.unit_price, pu.total_price, cur.name
+        FROM purchases pu
+        LEFT JOIN suppliers s ON pu.supplier_id = s.id
+        LEFT JOIN products p ON pu.product_id = p.id
+        LEFT JOIN currency cur ON pu.currency_id = cur.id
+        WHERE {where}
+        ORDER BY pu.transaction_time, pu.id
+    """, params)
+    rows = [[fmt_date(t), sname, pname, float(q), unit, float(up), float(tp), cname]
+            for t, sname, pname, q, unit, up, tp, cname in mycursor.fetchall()]
+    if not rows:
+        return None, f"⚠️ {period_label(year, month)}沒有符合條件的進貨紀錄"
+
+    headers = ["日期", "廠商", "貨品", "數量", "單位", "單價", "總額", "幣別"]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "進貨表"
+    write_title(ws, "川海 進貨表", f"期間：{period_label(year, month)}", len(headers))
+    next_row = write_table(ws, 4, headers, rows, money_cols=(6, 7), qty_cols=(4,))
+
+    # 不同幣別不能直接相加，所以依幣別分開小計
+    subtotals = {}
+    for r in rows:
+        subtotals[r[7]] = subtotals.get(r[7], 0.0) + r[6]
+    for cname, amt in sorted(subtotals.items(), key=lambda kv: str(kv[0])):
+        ws.cell(row=next_row, column=6, value="合計").font = Font(bold=True)
+        amt_cell = ws.cell(row=next_row, column=7, value=round(amt, 2))
+        amt_cell.font = Font(bold=True)
+        amt_cell.number_format = MONEY_FORMAT
+        ws.cell(row=next_row, column=8, value=cname).font = Font(bold=True)
+        next_row += 1
+    autofit_columns(ws)
+
+    path = new_export_path(f"進貨表_{year}{'' if month == ALL_MONTHS_LABEL else month}")
+    wb.save(path)
+    return path, f"✅ 已產生進貨表，共 {len(rows)} 筆，請點下方檔案下載"
+
+
+def export_invoice_excel(customer_id, year, month):
+    """請款單：某客戶某月的出貨明細，加上前期未收、本期已收，算出本期應收總額"""
+    if not customer_id:
+        return None, "⚠️ 請選擇要請款的客戶"
+    if month == ALL_MONTHS_LABEL:
+        return None, "⚠️ 請款單請選擇單一月份"
+
+    start = f"{int(year)}-{int(month):02d}-01"
+    end = get_month_cutoff(year, month)
+
+    mycursor.execute("SELECT name FROM customers WHERE id=%s", (customer_id,))
+    row = mycursor.fetchone()
+    customer_name = row[0] if row else f"客戶 #{customer_id}"
+
+    mycursor.execute("""
+        SELECT sa.transaction_time, p.name, sa.quantity, sa.unit, sa.unit_price, sa.total_price
+        FROM sales sa
+        LEFT JOIN products p ON sa.product_id = p.id
+        WHERE sa.customer_id = %s AND sa.transaction_time >= %s AND sa.transaction_time < %s
+        ORDER BY sa.transaction_time, sa.id
+    """, (customer_id, start, end))
+    items = [[fmt_date(t), pname, float(q), unit, float(up), float(tp)]
+             for t, pname, q, unit, up, tp in mycursor.fetchall()]
+
+    mycursor.execute("SELECT COALESCE(SUM(total_price), 0) FROM sales WHERE customer_id=%s AND transaction_time < %s",
+                     (customer_id, start))
+    prev_sales = float(mycursor.fetchone()[0])
+    mycursor.execute("SELECT COALESCE(SUM(amount), 0) FROM receivable_payments WHERE customer_id=%s AND payment_date < %s",
+                     (customer_id, start))
+    prev_paid = float(mycursor.fetchone()[0])
+    mycursor.execute("""SELECT COALESCE(SUM(amount), 0) FROM receivable_payments
+                        WHERE customer_id=%s AND payment_date >= %s AND payment_date < %s""",
+                     (customer_id, start, end))
+    period_paid = float(mycursor.fetchone()[0])
+
+    prev_balance = round(prev_sales - prev_paid, 2)
+    period_total = round(sum(r[5] for r in items), 2)
+    amount_due = round(prev_balance + period_total - period_paid, 2)
+
+    if not items and prev_balance == 0:
+        return None, f"⚠️ {customer_name} 在 {period_label(year, month)}沒有出貨，也沒有前期未收款，不需要請款"
+
+    headers = ["日期", "貨品", "數量", "單位", "單價", "金額"]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "請款單"
+    write_title(ws, "川海 請款單", "", len(headers))
+    ws.cell(row=2, column=1, value=f"客戶：{customer_name}")
+    ws.cell(row=3, column=1, value=f"請款期間：{period_label(year, month)}")
+    ws.cell(row=3, column=5, value=f"開立日期：{datetime.now():%Y-%m-%d}")
+
+    next_row = write_table(ws, 5, headers, items, money_cols=(5, 6), qty_cols=(3,))
+    next_row += 1
+    summary = [
+        ("前期未收", prev_balance),
+        ("本期出貨合計", period_total),
+        ("本期已收", -period_paid),
+        ("本期應收總額", amount_due) if amount_due >= 0 else ("溢收金額（可抵下期）", -amount_due),
+    ]
+    for i, (label, val) in enumerate(summary):
+        is_last = i == len(summary) - 1
+        label_cell = ws.cell(row=next_row, column=5, value=label)
+        val_cell = ws.cell(row=next_row, column=6, value=val)
+        val_cell.number_format = MONEY_FORMAT
+        for cell in (label_cell, val_cell):
+            cell.border = CELL_BORDER
+            if is_last:
+                cell.font = Font(bold=True, size=12)
+        next_row += 1
+    autofit_columns(ws)
+    ws.column_dimensions["A"].width = 14
+
+    safe_name = "".join(ch for ch in customer_name if ch not in '\\/:*?"<>|')
+    path = new_export_path(f"請款單_{safe_name}_{year}{int(month):02d}")
+    wb.save(path)
+    due_text = f"本期應收總額 {amount_due:,.2f}" if amount_due >= 0 else f"溢收 {-amount_due:,.2f}"
+    return path, f"✅ 已產生 {customer_name} 的請款單，{due_text}，請點下方檔案下載"
+
+
+def refresh_export_tab():
+    """點進『匯出/匯入』分頁時，重新查一次年份與客戶/廠商選單"""
+    years = get_export_year_choices()
+    customers = get_options("customers")
+    return (
+        gr.update(choices=years),
+        gr.update(choices=years),
+        gr.update(choices=years),
+        gr.update(choices=customers),
+        gr.update(choices=[("全部客戶", 0)] + customers),
+        gr.update(choices=[("全部廠商", 0)] + get_options("suppliers")),
+    )
+
+
+# ========== 匯入 ==========
+
+UNIT_CHOICES = ["公斤", "隻"]
+IMPORT_TYPES = {
+    "出貨": ["日期", "客戶", "貨品", "數量", "單位", "單價", "總額"],
+    "進貨": ["日期", "廠商", "貨品", "數量", "單位", "單價", "總額", "幣別"],
+    "廠商": ["名稱"],
+    "貨品": ["名稱"],
+    "顧客": ["名稱"],
+}
+IMPORT_EXAMPLES = {
+    "出貨": ["2026-09-01", "（請填基礎資料中已有的客戶名稱）", "（已有的貨品名稱）", 10, "公斤", 350, ""],
+    "進貨": ["2026-09-01", "（已有的廠商名稱）", "（已有的貨品名稱）", 100, "公斤", 5.5, "", "（已有的幣別名稱）"],
+    "廠商": ["（新廠商名稱）"],
+    "貨品": ["（新貨品名稱）"],
+    "顧客": ["（新顧客名稱）"],
+}
+BASIC_TABLE_OF = {"廠商": "suppliers", "貨品": "products", "顧客": "customers"}
+
+
+def download_import_template(import_type):
+    headers = IMPORT_TYPES[import_type]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = import_type
+    write_table(ws, 1, headers, [IMPORT_EXAMPLES[import_type]])
+    note_row = 4
+    ws.cell(row=note_row, column=1, value="說明：第 1 列是欄位名稱請勿修改，第 2 列是範例請刪除後再填入資料。").font = Font(color="C00000")
+    if import_type in ("出貨", "進貨"):
+        ws.cell(row=note_row + 1, column=1, value="日期格式 YYYY-MM-DD，空白代表今天；單位只能填「公斤」或「隻」；總額空白會自動用 數量×單價 計算。").font = Font(color="C00000")
+    autofit_columns(ws)
+    path = new_export_path(f"匯入範本_{import_type}")
+    wb.save(path)
+    return path
+
+
+def read_import_file(path):
+    """讀取使用者上傳的 Excel / CSV，全部當成文字/原始值讀進來，後面再逐欄檢查"""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".xlsx", ".xlsm", ".xls"):
+        return pd.read_excel(path, dtype=object)
+    if ext == ".csv":
+        # Excel 存出來的 CSV 在台灣常是 Big5(cp950)，UTF-8 讀失敗就換 cp950
+        for enc in ("utf-8-sig", "cp950"):
+            try:
+                return pd.read_csv(path, dtype=object, encoding=enc)
+            except UnicodeDecodeError:
+                continue
+        raise ValueError("無法辨識 CSV 的文字編碼，請另存成 UTF-8 或 Excel 檔")
+    raise ValueError("只支援 .xlsx 或 .csv 檔案")
+
+
+def cell_text(val):
+    if val is None or (isinstance(val, float) and pd.isna(val)) or val is pd.NaT:
+        return ""
+    return str(val).strip()
+
+
+def parse_import_date(val):
+    """回傳 datetime 字串；空白代表現在時間；格式錯誤回傳 None"""
+    if hasattr(val, "strftime") and not pd.isna(val):
+        return val.strftime("%Y-%m-%d %H:%M:%S")
+    text = cell_text(val)
+    if not text:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    return None
+
+
+def name_to_id_map(table):
+    return {name.strip(): id_ for name, id_ in get_options(table)}
+
+
+def validate_import(file_path, import_type):
+    """檢查上傳檔案的每一列，回傳 (預覽表格, 可匯入的資料, 訊息)。有任何一列錯誤就整批不匯入"""
+    empty = pd.DataFrame(columns=["列號", "狀態"] + IMPORT_TYPES[import_type])
+    if not file_path:
+        return empty, [], "⚠️ 請先上傳檔案"
+    try:
+        df = read_import_file(file_path)
+    except Exception as e:
+        return empty, [], f"⚠️ 讀取檔案失敗：{e}"
+
+    df.columns = [str(c).strip() for c in df.columns]
+    required = IMPORT_TYPES[import_type]
+    optional = {"總額", "日期"}
+    missing = [c for c in required if c not in df.columns and c not in optional]
+    if missing:
+        return empty, [], f"⚠️ 檔案缺少欄位：{'、'.join(missing)}（可以先下載範本再填寫）"
+    for c in required:
+        if c not in df.columns:
+            df[c] = None
+    # 整列都空白的直接略過
+    df = df[required].dropna(how="all")
+    if df.empty:
+        return empty, [], "⚠️ 檔案中沒有任何資料列"
+
+    preview, valid_rows, error_count = [], [], 0
+
+    if import_type in BASIC_TABLE_OF:
+        existing = set(name_to_id_map(BASIC_TABLE_OF[import_type]))
+        seen = set()
+        for idx, r in df.iterrows():
+            name = cell_text(r["名稱"])
+            excel_row = idx + 2  # 第 1 列是標題
+            if not name:
+                status = "❌ 名稱空白"
+                error_count += 1
+            elif name in existing:
+                status = "⏭️ 已存在，略過"
+            elif name in seen:
+                status = "⏭️ 檔案內重複，略過"
+            else:
+                status = "✅ 可匯入"
+                seen.add(name)
+                valid_rows.append([name])
+            preview.append([excel_row, status, name])
+    else:
+        party_label = "客戶" if import_type == "出貨" else "廠商"
+        party_map = name_to_id_map("customers" if import_type == "出貨" else "suppliers")
+        product_map = name_to_id_map("products")
+        currency_map = name_to_id_map("currency") if import_type == "進貨" else {}
+
+        for idx, r in df.iterrows():
+            excel_row = idx + 2
+            errors = []
+            tdate = parse_import_date(r["日期"])
+            if tdate is None:
+                errors.append("日期格式錯誤")
+            party_name = cell_text(r[party_label])
+            if party_name not in party_map:
+                errors.append(f"找不到{party_label}「{party_name}」" if party_name else f"{party_label}空白")
+            product_name = cell_text(r["貨品"])
+            if product_name not in product_map:
+                errors.append(f"找不到貨品「{product_name}」" if product_name else "貨品空白")
+            qty_f = parse_positive_number(cell_text(r["數量"]).replace(",", ""))
+            if qty_f is None:
+                errors.append("數量錯誤")
+            price_f = parse_positive_number(cell_text(r["單價"]).replace(",", ""))
+            if price_f is None:
+                errors.append("單價錯誤")
+            unit = cell_text(r["單位"])
+            if unit not in UNIT_CHOICES:
+                errors.append("單位需為公斤或隻")
+            total_text = cell_text(r["總額"]).replace(",", "")
+            total_f = parse_positive_number(total_text) if total_text else None
+            if total_text and total_f is None:
+                errors.append("總額錯誤")
+            if total_f is None and qty_f is not None and price_f is not None:
+                total_f = round(qty_f * price_f, 2)
+            currency_name = ""
+            if import_type == "進貨":
+                currency_name = cell_text(r["幣別"])
+                if currency_name not in currency_map:
+                    errors.append(f"找不到幣別「{currency_name}」" if currency_name else "幣別空白")
+
+            display = [excel_row, "", (tdate or cell_text(r["日期"]))[:10], party_name, product_name,
+                       qty_f if qty_f is not None else cell_text(r["數量"]), unit,
+                       price_f if price_f is not None else cell_text(r["單價"]),
+                       total_f if total_f is not None else total_text]
+            if import_type == "進貨":
+                display.append(currency_name)
+
+            if errors:
+                display[1] = "❌ " + "、".join(errors)
+                error_count += 1
+            else:
+                display[1] = "✅ 可匯入"
+                rec = [tdate, party_map[party_name], product_map[product_name], qty_f, unit, price_f, total_f]
+                if import_type == "進貨":
+                    rec.append(currency_map[currency_name])
+                valid_rows.append(rec)
+            preview.append(display)
+
+    preview_df = pd.DataFrame(preview, columns=["列號", "狀態"] + required)
+    if error_count:
+        return preview_df, [], f"⚠️ 有 {error_count} 列資料有問題（見下方狀態欄），請修正檔案後重新上傳檢查。為避免只匯入一半，這次不會匯入任何資料。"
+    if not valid_rows:
+        return preview_df, [], "ℹ️ 沒有需要匯入的新資料"
+    return preview_df, valid_rows, f"✅ 檢查通過，共 {len(valid_rows)} 筆可匯入，確認無誤請按「確認匯入」"
+
+
+def confirm_import(import_type, valid_rows):
+    if not valid_rows:
+        return "⚠️ 沒有可匯入的資料，請先上傳檔案並按「檢查資料」", valid_rows
+    try:
+        if import_type in BASIC_TABLE_OF:
+            sql = "INSERT INTO %s (name) VALUES (%%s)" % BASIC_TABLE_OF[import_type]
+            mycursor.executemany(sql, valid_rows)
+        elif import_type == "出貨":
+            mycursor.executemany("""
+                INSERT INTO sales (transaction_time, customer_id, product_id, quantity, unit, unit_price, total_price)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, valid_rows)
+        else:
+            mycursor.executemany("""
+                INSERT INTO purchases (transaction_time, supplier_id, product_id, quantity, unit, unit_price, total_price, currency_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, valid_rows)
+        mydb.commit()
+    except pymysql.MySQLError as e:
+        mydb.rollback()
+        return f"⚠️ 匯入失敗，已全部復原，沒有寫入任何資料：{e}", valid_rows
+    return f"✅ 已成功匯入 {len(valid_rows)} 筆{import_type}資料", []
+
+
+def reset_import_preview(import_type):
+    return pd.DataFrame(columns=["列號", "狀態"] + IMPORT_TYPES[import_type]), [], ""
+
+
 with gr.Blocks() as demo:
     with gr.Tabs() as tabs:
         with gr.TabItem("首頁", id="home"):
             gr.Markdown(
                 "## 歡迎使用川海 ERP\n\n"
                 "請從上方分頁選擇「出貨」、「進貨」、「庫存」或「基礎資料設定」開始操作。\n\n"
-                "廠商／貨品／顧客／幣別的新增、修改、刪除，都可在本頁面的「基礎資料設定」分頁完成。"
+                "廠商／貨品／顧客／幣別的新增、修改、刪除，都可在本頁面的「基礎資料設定」分頁完成。\n\n"
+                "請款單、出貨表、進貨表的 Excel 匯出，以及批次匯入資料，請到「匯出/匯入」分頁。"
             )
 
         with gr.TabItem("出貨", id="sales") as sales_tab:
@@ -1838,6 +2307,63 @@ with gr.Blocks() as demo:
                         interactive=False,
                     )
 
+        with gr.TabItem("匯出/匯入", id="export_import") as export_import_tab:
+            export_years = get_export_year_choices()
+            export_months = [ALL_MONTHS_LABEL] + [f"{m:02d}" for m in range(1, 13)]
+            this_month = f"{datetime.now().month:02d}"
+            with gr.Tabs():
+                with gr.TabItem("匯出"):
+                    gr.Markdown("選擇條件後按下按鈕，會產生 Excel 檔（.xlsx），再點檔案即可下載。")
+
+                    gr.Markdown("<h3>請款單</h3>客戶某月的出貨明細，並列出前期未收、本期已收與本期應收總額。")
+                    with gr.Row():
+                        inv_cus_dp = gr.Dropdown(choices=get_options("customers"), label="客戶", interactive=True)
+                        inv_year_dp = gr.Dropdown(choices=export_years, value=export_years[0], label="年份", interactive=True)
+                        inv_month_dp = gr.Dropdown(choices=export_months[1:], value=this_month, label="月份", interactive=True)
+                        inv_export_btn = gr.Button("產生請款單", variant="primary")
+
+                    gr.Markdown("<h3 style='margin-top: 30px;'>出貨表</h3>")
+                    with gr.Row():
+                        exp_sale_cus_dp = gr.Dropdown(choices=[("全部客戶", 0)] + get_options("customers"), value=0, label="客戶", interactive=True)
+                        exp_sale_year_dp = gr.Dropdown(choices=export_years, value=export_years[0], label="年份", interactive=True)
+                        exp_sale_month_dp = gr.Dropdown(choices=export_months, value=this_month, label="月份", interactive=True)
+                        exp_sale_btn = gr.Button("匯出出貨表", variant="primary")
+
+                    gr.Markdown("<h3 style='margin-top: 30px;'>進貨表</h3>")
+                    with gr.Row():
+                        exp_pur_sup_dp = gr.Dropdown(choices=[("全部廠商", 0)] + get_options("suppliers"), value=0, label="廠商", interactive=True)
+                        exp_pur_year_dp = gr.Dropdown(choices=export_years, value=export_years[0], label="年份", interactive=True)
+                        exp_pur_month_dp = gr.Dropdown(choices=export_months, value=this_month, label="月份", interactive=True)
+                        exp_pur_btn = gr.Button("匯出進貨表", variant="primary")
+
+                    export_msg = gr.Markdown("")
+                    export_file = gr.File(label="下載檔案", interactive=False)
+
+                with gr.TabItem("匯入"):
+                    gr.Markdown(
+                        "批次匯入資料，不用一筆筆手動輸入。步驟：\n"
+                        "1. 選擇要匯入的資料類型，下載範本\n"
+                        "2. 用 Excel 填好資料後上傳（支援 .xlsx、.csv）\n"
+                        "3. 按「檢查資料」確認每一列都正確，再按「確認匯入」\n\n"
+                        "客戶／廠商／貨品／幣別要先存在於「基礎資料設定」中，名稱必須完全一樣。"
+                    )
+                    with gr.Row():
+                        import_type_dp = gr.Dropdown(choices=list(IMPORT_TYPES), value="出貨", label="資料類型", interactive=True)
+                        template_btn = gr.Button("下載範本")
+                    template_file = gr.File(label="範本檔", interactive=False)
+                    import_file = gr.File(label="上傳要匯入的檔案", file_types=[".xlsx", ".csv"], type="filepath")
+                    with gr.Row():
+                        import_check_btn = gr.Button("檢查資料")
+                        import_confirm_btn = gr.Button("確認匯入", variant="primary")
+                    import_msg = gr.Markdown("")
+                    import_valid_state = gr.State(value=[])
+                    import_preview = gr.Dataframe(
+                        value=pd.DataFrame(columns=["列號", "狀態"] + IMPORT_TYPES["出貨"]),
+                        label="檢查結果",
+                        interactive=False,
+                        wrap=True,
+                    )
+
     # ---------- 進貨 ----------
     insert.click(
         fn=insert_purchas,
@@ -2085,6 +2611,42 @@ with gr.Blocks() as demo:
             pay_balance_table, pay_payment_table, pay_payment_raw_state,
             pay_unalloc_cbg, pay_preview,
         ],
+    )
+
+    # ---------- 匯出/匯入 ----------
+    inv_export_btn.click(
+        fn=export_invoice_excel,
+        inputs=[inv_cus_dp, inv_year_dp, inv_month_dp],
+        outputs=[export_file, export_msg],
+    )
+    exp_sale_btn.click(
+        fn=export_sales_excel,
+        inputs=[exp_sale_year_dp, exp_sale_month_dp, exp_sale_cus_dp],
+        outputs=[export_file, export_msg],
+    )
+    exp_pur_btn.click(
+        fn=export_purchases_excel,
+        inputs=[exp_pur_year_dp, exp_pur_month_dp, exp_pur_sup_dp],
+        outputs=[export_file, export_msg],
+    )
+    export_import_tab.select(
+        fn=refresh_export_tab,
+        outputs=[inv_year_dp, exp_sale_year_dp, exp_pur_year_dp, inv_cus_dp, exp_sale_cus_dp, exp_pur_sup_dp],
+    )
+
+    template_btn.click(fn=download_import_template, inputs=import_type_dp, outputs=template_file)
+    # 換資料類型或換檔案時，清掉上一次的檢查結果，避免誤匯入舊的資料
+    import_type_dp.change(fn=reset_import_preview, inputs=import_type_dp, outputs=[import_preview, import_valid_state, import_msg])
+    import_file.change(fn=reset_import_preview, inputs=import_type_dp, outputs=[import_preview, import_valid_state, import_msg])
+    import_check_btn.click(
+        fn=validate_import,
+        inputs=[import_file, import_type_dp],
+        outputs=[import_preview, import_valid_state, import_msg],
+    )
+    import_confirm_btn.click(
+        fn=confirm_import,
+        inputs=[import_type_dp, import_valid_state],
+        outputs=[import_msg, import_valid_state],
     )
 
 
