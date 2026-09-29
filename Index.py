@@ -3,14 +3,40 @@ import gradio as gr
 import pandas as pd
 import os
 import tempfile
+import threading
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from config import DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, APP_NAME
 
-mydb = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
-mycursor = mydb.cursor()
+_db_local = threading.local()
+
+
+def _get_db_connection():
+    """每個執行緒各用一條自己的資料庫連線。
+    Gradio 會同時用多個執行緒處理請求，如果大家共用同一條連線，查詢結果會互相拿錯，
+    連線也會被弄壞（畫面出現「錯誤」、下拉選單出現別的資料表的內容）。
+    autocommit=True：每次查詢都看得到最新資料；需要多個寫入一起成功/失敗時，用 mydb.begin() 開交易。"""
+    conn = getattr(_db_local, "conn", None)
+    if conn is None or not conn.open:
+        conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME, autocommit=True)
+        _db_local.conn = conn
+        _db_local.cursor = conn.cursor()
+    return conn
+
+
+class _ThreadLocalDB:
+    """讓 mydb / mycursor 照原本的寫法使用，但實際上會轉給目前執行緒自己的連線"""
+    def __init__(self, getter):
+        self._getter = getter
+
+    def __getattr__(self, name):
+        return getattr(self._getter(), name)
+
+
+mydb = _ThreadLocalDB(_get_db_connection)
+mycursor = _ThreadLocalDB(lambda: (_get_db_connection(), _db_local.cursor)[1])
 
 
 def get_options(item):
@@ -1255,6 +1281,7 @@ def insert_payable_payment(supplier_id, currency_id, pdate, twd_total, selected_
 
     effective_rate = twd_f / foreign_total
 
+    mydb.begin()  # 付款與分配明細要一起寫入
     mycursor.execute(
         "INSERT INTO payable_payments (supplier_id, payment_date, amount, exchange_rate, note) VALUES (%s, %s, %s, %s, %s)",
         (supplier_id, date_ok, twd_f, round(effective_rate, 4), (note or "").strip() or None),
@@ -1915,6 +1942,7 @@ def confirm_import(import_type, state):
     rows, new_names = state["rows"], state["new"]
     try:
         # 先新增缺少的客戶/廠商/貨品，跟出貨/進貨在同一個交易裡，失敗就全部復原
+        mydb.begin()
         for table, names in new_names.items():
             mycursor.executemany("INSERT INTO %s (name) VALUES (%%s)" % table, [[n] for n in names])
 
