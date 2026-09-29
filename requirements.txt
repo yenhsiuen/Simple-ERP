@@ -1,0 +1,4 @@
+gradio
+pymysql
+pandas
+openpyxl

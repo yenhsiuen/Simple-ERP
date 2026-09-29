@@ -7,8 +7,9 @@ from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from config import DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, APP_NAME
 
-mydb = pymysql.connect(host="localhost", user="root", password="4567", database="川海erp")
+mydb = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
 mycursor = mydb.cursor()
 
 
@@ -1457,7 +1458,7 @@ def auto_calculate_total(qty_str, price_str):
 
 # ========== 匯出 ==========
 
-EXPORT_DIR = os.path.join(tempfile.gettempdir(), "川海erp_匯出")
+EXPORT_DIR = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_erp_匯出")
 ALL_MONTHS_LABEL = "全年"
 MONEY_FORMAT = "#,##0.00"
 QTY_FORMAT = "#,##0.##"
@@ -1554,7 +1555,7 @@ def export_sales_excel(year, month, customer_id):
     wb = Workbook()
     ws = wb.active
     ws.title = "出貨表"
-    write_title(ws, "川海 出貨表", f"期間：{period_label(year, month)}", len(headers))
+    write_title(ws, f"{APP_NAME} 出貨表", f"期間：{period_label(year, month)}", len(headers))
     next_row = write_table(ws, 4, headers, rows, money_cols=(6, 7), qty_cols=(4,))
     ws.cell(row=next_row, column=6, value="合計").font = Font(bold=True)
     total_cell = ws.cell(row=next_row, column=7, value=round(sum(r[6] for r in rows), 2))
@@ -1590,7 +1591,7 @@ def export_purchases_excel(year, month, supplier_id):
     wb = Workbook()
     ws = wb.active
     ws.title = "進貨表"
-    write_title(ws, "川海 進貨表", f"期間：{period_label(year, month)}", len(headers))
+    write_title(ws, f"{APP_NAME} 進貨表", f"期間：{period_label(year, month)}", len(headers))
     next_row = write_table(ws, 4, headers, rows, money_cols=(6, 7), qty_cols=(4,))
 
     # 不同幣別不能直接相加，所以依幣別分開小計
@@ -1657,7 +1658,7 @@ def export_invoice_excel(customer_id, year, month):
     wb = Workbook()
     ws = wb.active
     ws.title = "請款單"
-    write_title(ws, "川海 請款單", "", len(headers))
+    write_title(ws, f"{APP_NAME} 請款單", "", len(headers))
     ws.cell(row=2, column=1, value=f"客戶：{customer_name}")
     ws.cell(row=3, column=1, value=f"請款期間：{period_label(year, month)}")
     ws.cell(row=3, column=5, value=f"開立日期：{datetime.now():%Y-%m-%d}")
@@ -1922,7 +1923,7 @@ with gr.Blocks() as demo:
     with gr.Tabs() as tabs:
         with gr.TabItem("首頁", id="home"):
             gr.Markdown(
-                "## 歡迎使用川海 ERP\n\n"
+                f"## 歡迎使用{APP_NAME} ERP\n\n"
                 "請從上方分頁選擇「出貨」、「進貨」、「庫存」或「基礎資料設定」開始操作。\n\n"
                 "廠商／貨品／顧客／幣別的新增、修改、刪除，都可在本頁面的「基礎資料設定」分頁完成。\n\n"
                 "請款單、出貨表、進貨表的 Excel 匯出，以及批次匯入資料，請到「匯出/匯入」分頁。"
