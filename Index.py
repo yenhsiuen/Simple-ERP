@@ -2,8 +2,10 @@ import pymysql
 import gradio as gr
 import pandas as pd
 import os
+import re
 import tempfile
 import threading
+import unicodedata
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -1809,6 +1811,33 @@ def name_to_id_map(table):
     return {name.strip(): id_ for name, id_ in get_options(table)}
 
 
+TABLE_LABELS = {"customers": "客戶", "suppliers": "廠商", "products": "貨品"}
+
+
+def normalize_name(name):
+    """把名稱轉成比對用的形式：全形轉半形、去掉空格與括號等符號、英文轉小寫。
+    例如「紅蟳(200g)」、「紅蟳 200G」、「紅蟳（200g）」都會變成「紅蟳200g」"""
+    name = unicodedata.normalize("NFKC", name)
+    return re.sub(r"[\s()\[\]{}\-_.,/·、]", "", name).lower()
+
+
+def find_similar_names(new_names, existing_names):
+    """把新名稱跟既有名稱、以及同一批其他新名稱比對，比對形式相同的歸成一組。
+    只回傳至少包含一個新名稱、且超過一個名稱的組，例如 [[("現有", "紅蟳(200g)"), ("檔案中", "紅蟳200g")]]"""
+    groups = {}
+    for n in existing_names:
+        groups.setdefault(normalize_name(n), []).append(("現有", n))
+    for n in new_names:
+        groups.setdefault(normalize_name(n), []).append(("檔案中", n))
+    return [g for g in groups.values() if len(g) > 1 and any(src == "檔案中" for src, _ in g)]
+
+
+def warning_box(html):
+    """橘色底框，讓需要注意的訊息跟一般訊息區分開"""
+    return ('<div style="border-left:5px solid #f59e0b;background:rgba(245,158,11,0.15);'
+            f'padding:12px 16px;border-radius:6px;margin:8px 0;">{html}</div>')
+
+
 def validate_import(file_path, import_type):
     """檢查上傳檔案的每一列，回傳 (預覽表格, 可匯入的資料, 訊息)。有任何一列錯誤就整批不匯入"""
     empty = pd.DataFrame(columns=["列號", "狀態"] + IMPORT_TYPES[import_type])
@@ -1838,6 +1867,7 @@ def validate_import(file_path, import_type):
     new_names = {}
 
     if import_type in BASIC_TABLE_OF:
+        name_cols = [(BASIC_TABLE_OF[import_type], 2)]  # (資料表, 名稱在預覽列中的位置)，給相似名稱標示用
         existing = set(name_to_id_map(BASIC_TABLE_OF[import_type]))
         seen = set()
         for idx, r in df.iterrows():
@@ -1862,10 +1892,11 @@ def validate_import(file_path, import_type):
         product_map = name_to_id_map("products")
         currency_map = name_to_id_map("currency") if import_type == "進貨" else {}
         new_names = {party_table: [], "products": []}
+        name_cols = [(party_table, 3), ("products", 4)]
 
         for idx, r in df.iterrows():
             excel_row = idx + 2
-            errors, adds = [], []
+            errors = []
             tdate = parse_import_date(r["日期"])
             if tdate is None:
                 errors.append("日期格式錯誤")
@@ -1873,10 +1904,8 @@ def validate_import(file_path, import_type):
                 name = cell_text(r[label])
                 if not name:
                     errors.append(f"{label}空白")
-                elif name not in name_map:
-                    adds.append(f"將新增{label}「{name}」")
-                    if name not in new_names[table]:
-                        new_names[table].append(name)
+                elif name not in name_map and name not in new_names[table]:
+                    new_names[table].append(name)
             party_name = cell_text(r[party_label])
             product_name = cell_text(r["貨品"])
             qty_f = parse_positive_number(cell_text(r["數量"]).replace(",", ""))
@@ -1912,7 +1941,6 @@ def validate_import(file_path, import_type):
                 display[1] = "❌ " + "、".join(errors)
                 error_count += 1
             else:
-                display[1] = "🆕 可匯入（" + "、".join(adds) + "）" if adds else "✅ 可匯入"
                 # 客戶/廠商、貨品先存名稱，確認匯入時新增完缺少的基礎資料後再換成 id
                 rec = [tdate, party_name, product_name, qty_f, unit, price_f, total_f]
                 if import_type == "進貨":
@@ -1920,20 +1948,48 @@ def validate_import(file_path, import_type):
                 valid_rows.append(rec)
             preview.append(display)
 
-    preview_df = pd.DataFrame(preview, columns=["列號", "狀態"] + required)
     new_names = {t: names for t, names in new_names.items() if names}
+
+    # 相似名稱檢查：匯入廠商/貨品/顧客時，要新增的就是檔案裡的名稱本身；出貨/進貨則是自動新增的名稱
+    names_to_check = {BASIC_TABLE_OF[import_type]: [r[0] for r in valid_rows]} if import_type in BASIC_TABLE_OF else new_names
+    similar_lines, warn_by_name = [], {}
+    for table, names in names_to_check.items():
+        for group in find_similar_names(names, list(name_to_id_map(table))):
+            similar_lines.append(f"<li>{TABLE_LABELS[table]}：" + " ↔ ".join(f"{src}的「{n}」" for src, n in group) + "</li>")
+            for src, n in group:
+                if src == "檔案中":
+                    others = "、".join(f"{s}的「{o}」" for s, o in group if (s, o) != (src, n))
+                    warn_by_name[(table, n)] = f"⚠️ {TABLE_LABELS[table]}「{n}」跟{others}幾乎一樣"
+    # 把相似名稱的提醒也標在表格的每一列上，讓人在表格就看得到
+    for p in preview:
+        warns = [warn_by_name[(t, p[i])] for t, i in name_cols if (t, p[i]) in warn_by_name]
+        if warns and not p[1].startswith("⏭️"):
+            p[1] = "；".join(([p[1]] if p[1].startswith("❌") else []) + warns)
+
+    # 表格只列出有錯誤或需要注意的列，都沒問題時表格是空的
+    flagged_df = pd.DataFrame([p for p in preview if p[1].startswith(("❌", "⚠️"))], columns=["列號", "狀態"] + required)
     if error_count:
-        return preview_df, [], f"⚠️ 有 {error_count} 列資料有問題（見下方狀態欄），請修正檔案後重新上傳檢查。為避免只匯入一半，這次不會匯入任何資料。"
+        return flagged_df, [], f"⚠️ 有 {error_count} 列資料有問題（見下方表格），請修正檔案後重新上傳檢查。為避免只匯入一半，這次不會匯入任何資料。"
     if not valid_rows:
-        return preview_df, [], "ℹ️ 沒有需要匯入的新資料"
-    msg = f"✅ 檢查通過，共 {len(valid_rows)} 筆可匯入"
+        return flagged_df, [], "ℹ️ 沒有需要匯入的新資料"
+
+    if similar_lines:
+        msg = f"### ⚠️ 有 {len(similar_lines)} 組名稱疑似打錯字，請先確認再匯入（共 {len(valid_rows)} 筆資料）"
+        msg += "\n\n" + warning_box(
+            "<b>以下新名稱跟其他名稱幾乎一樣（只差空格、括號或全形半形）：</b>"
+            f"<ul>{''.join(similar_lines)}</ul>"
+            "如果是同一個，請把檔案裡的名稱改成一致後重新上傳檢查；確定是不同的就直接匯入。"
+            "用到這些名稱的資料列標示在下方表格。"
+        )
+    else:
+        msg = f"### ✅ 檢查通過，共 {len(valid_rows)} 筆可匯入"
     if new_names:
-        table_labels = {"customers": "客戶", "suppliers": "廠商", "products": "貨品"}
-        lines = [f"- {table_labels[t]}：{'、'.join(names)}" for t, names in new_names.items()]
-        msg += "\n\n🆕 **以下名稱在基礎資料中找不到，確認匯入時會自動新增，請確認沒有打錯字：**\n" + "\n".join(lines)
-        msg += "\n\n如果是打錯字，請修正檔案後重新上傳檢查。"
+        summary = "、".join(f"{TABLE_LABELS[t]} {len(n)} 個" for t, n in new_names.items())
+        details = "\n".join(f"<p>{TABLE_LABELS[t]}：{'、'.join(n)}</p>" for t, n in new_names.items())
+        msg += (f"\n\n🆕 匯入時會自動新增：{summary}"
+                f"\n\n<details><summary>點這裡查看完整名單</summary>{details}</details>")
     msg += "\n\n確認無誤請按「確認匯入」"
-    return preview_df, {"rows": valid_rows, "new": new_names}, msg
+    return flagged_df, {"rows": valid_rows, "new": new_names}, msg
 
 
 def confirm_import(import_type, state):
@@ -2419,7 +2475,7 @@ with gr.Blocks() as demo:
                     import_valid_state = gr.State(value=[])
                     import_preview = gr.Dataframe(
                         value=pd.DataFrame(columns=["列號", "狀態"] + IMPORT_TYPES["出貨"]),
-                        label="檢查結果",
+                        label="有錯誤或需要注意的資料列（都沒問題時是空的）",
                         interactive=False,
                         wrap=True,
                     )
