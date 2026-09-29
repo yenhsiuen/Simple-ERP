@@ -2579,6 +2579,12 @@ with gr.Blocks() as demo:
         outputs=[trend_chart, loss_chart_box],
     )
     dashboard_tab.select(fn=refresh_dashboard_year_choices, outputs=dash_year_dp)
+    # 走勢圖資料是啟動時算好存在 State 裡的，點進分頁時要重算，否則新增/匯入的資料不會出現
+    dashboard_tab.select(
+        fn=refresh_trend_chart,
+        inputs=[trend_mode_dp, trend_series_cbg],
+        outputs=[trend_chart, loss_trend_chart, loss_chart_box, trend_main_state, trend_loss_state],
+    )
 
     # ---------- 進貨/出貨/庫存分頁：每次點進去都重新查一次下拉選單 ----------
     purchases_tab.select(fn=refresh_purchase_dropdowns, outputs=[sup_dp, pro_dp, Cur_dp])
