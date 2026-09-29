@@ -1807,6 +1807,8 @@ def validate_import(file_path, import_type):
         return empty, [], "⚠️ 檔案中沒有任何資料列"
 
     preview, valid_rows, error_count = [], [], 0
+    # 出貨/進貨檔案中出現、但基礎資料還沒有的名稱：{資料表: [名稱, ...]}，確認匯入時會先新增
+    new_names = {}
 
     if import_type in BASIC_TABLE_OF:
         existing = set(name_to_id_map(BASIC_TABLE_OF[import_type]))
@@ -1828,22 +1830,28 @@ def validate_import(file_path, import_type):
             preview.append([excel_row, status, name])
     else:
         party_label = "客戶" if import_type == "出貨" else "廠商"
-        party_map = name_to_id_map("customers" if import_type == "出貨" else "suppliers")
+        party_table = "customers" if import_type == "出貨" else "suppliers"
+        party_map = name_to_id_map(party_table)
         product_map = name_to_id_map("products")
         currency_map = name_to_id_map("currency") if import_type == "進貨" else {}
+        new_names = {party_table: [], "products": []}
 
         for idx, r in df.iterrows():
             excel_row = idx + 2
-            errors = []
+            errors, adds = [], []
             tdate = parse_import_date(r["日期"])
             if tdate is None:
                 errors.append("日期格式錯誤")
+            for label, table, name_map in ((party_label, party_table, party_map), ("貨品", "products", product_map)):
+                name = cell_text(r[label])
+                if not name:
+                    errors.append(f"{label}空白")
+                elif name not in name_map:
+                    adds.append(f"將新增{label}「{name}」")
+                    if name not in new_names[table]:
+                        new_names[table].append(name)
             party_name = cell_text(r[party_label])
-            if party_name not in party_map:
-                errors.append(f"找不到{party_label}「{party_name}」" if party_name else f"{party_label}空白")
             product_name = cell_text(r["貨品"])
-            if product_name not in product_map:
-                errors.append(f"找不到貨品「{product_name}」" if product_name else "貨品空白")
             qty_f = parse_positive_number(cell_text(r["數量"]).replace(",", ""))
             if qty_f is None:
                 errors.append("數量錯誤")
@@ -1862,8 +1870,9 @@ def validate_import(file_path, import_type):
             currency_name = ""
             if import_type == "進貨":
                 currency_name = cell_text(r["幣別"])
+                # 幣別會影響匯率與應付帳款計算，不自動新增，必須先到基礎資料設定建立
                 if currency_name not in currency_map:
-                    errors.append(f"找不到幣別「{currency_name}」" if currency_name else "幣別空白")
+                    errors.append(f"找不到幣別「{currency_name}」，請先到基礎資料設定新增" if currency_name else "幣別空白")
 
             display = [excel_row, "", (tdate or cell_text(r["日期"]))[:10], party_name, product_name,
                        qty_f if qty_f is not None else cell_text(r["數量"]), unit,
@@ -1876,43 +1885,65 @@ def validate_import(file_path, import_type):
                 display[1] = "❌ " + "、".join(errors)
                 error_count += 1
             else:
-                display[1] = "✅ 可匯入"
-                rec = [tdate, party_map[party_name], product_map[product_name], qty_f, unit, price_f, total_f]
+                display[1] = "🆕 可匯入（" + "、".join(adds) + "）" if adds else "✅ 可匯入"
+                # 客戶/廠商、貨品先存名稱，確認匯入時新增完缺少的基礎資料後再換成 id
+                rec = [tdate, party_name, product_name, qty_f, unit, price_f, total_f]
                 if import_type == "進貨":
                     rec.append(currency_map[currency_name])
                 valid_rows.append(rec)
             preview.append(display)
 
     preview_df = pd.DataFrame(preview, columns=["列號", "狀態"] + required)
+    new_names = {t: names for t, names in new_names.items() if names}
     if error_count:
         return preview_df, [], f"⚠️ 有 {error_count} 列資料有問題（見下方狀態欄），請修正檔案後重新上傳檢查。為避免只匯入一半，這次不會匯入任何資料。"
     if not valid_rows:
         return preview_df, [], "ℹ️ 沒有需要匯入的新資料"
-    return preview_df, valid_rows, f"✅ 檢查通過，共 {len(valid_rows)} 筆可匯入，確認無誤請按「確認匯入」"
+    msg = f"✅ 檢查通過，共 {len(valid_rows)} 筆可匯入"
+    if new_names:
+        table_labels = {"customers": "客戶", "suppliers": "廠商", "products": "貨品"}
+        lines = [f"- {table_labels[t]}：{'、'.join(names)}" for t, names in new_names.items()]
+        msg += "\n\n🆕 **以下名稱在基礎資料中找不到，確認匯入時會自動新增，請確認沒有打錯字：**\n" + "\n".join(lines)
+        msg += "\n\n如果是打錯字，請修正檔案後重新上傳檢查。"
+    msg += "\n\n確認無誤請按「確認匯入」"
+    return preview_df, {"rows": valid_rows, "new": new_names}, msg
 
 
-def confirm_import(import_type, valid_rows):
-    if not valid_rows:
-        return "⚠️ 沒有可匯入的資料，請先上傳檔案並按「檢查資料」", valid_rows
+def confirm_import(import_type, state):
+    if not state or not state.get("rows"):
+        return "⚠️ 沒有可匯入的資料，請先上傳檔案並按「檢查資料」", state
+    rows, new_names = state["rows"], state["new"]
     try:
+        # 先新增缺少的客戶/廠商/貨品，跟出貨/進貨在同一個交易裡，失敗就全部復原
+        for table, names in new_names.items():
+            mycursor.executemany("INSERT INTO %s (name) VALUES (%%s)" % table, [[n] for n in names])
+
         if import_type in BASIC_TABLE_OF:
-            sql = "INSERT INTO %s (name) VALUES (%%s)" % BASIC_TABLE_OF[import_type]
-            mycursor.executemany(sql, valid_rows)
-        elif import_type == "出貨":
-            mycursor.executemany("""
-                INSERT INTO sales (transaction_time, customer_id, product_id, quantity, unit, unit_price, total_price)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, valid_rows)
+            mycursor.executemany("INSERT INTO %s (name) VALUES (%%s)" % BASIC_TABLE_OF[import_type], rows)
         else:
-            mycursor.executemany("""
-                INSERT INTO purchases (transaction_time, supplier_id, product_id, quantity, unit, unit_price, total_price, currency_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, valid_rows)
+            party_table = "customers" if import_type == "出貨" else "suppliers"
+            party_map = name_to_id_map(party_table)
+            product_map = name_to_id_map("products")
+            db_rows = [[r[0], party_map[r[1]], product_map[r[2]], *r[3:]] for r in rows]
+            if import_type == "出貨":
+                mycursor.executemany("""
+                    INSERT INTO sales (transaction_time, customer_id, product_id, quantity, unit, unit_price, total_price)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, db_rows)
+            else:
+                mycursor.executemany("""
+                    INSERT INTO purchases (transaction_time, supplier_id, product_id, quantity, unit, unit_price, total_price, currency_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, db_rows)
         mydb.commit()
-    except pymysql.MySQLError as e:
+    except (pymysql.MySQLError, KeyError) as e:
         mydb.rollback()
-        return f"⚠️ 匯入失敗，已全部復原，沒有寫入任何資料：{e}", valid_rows
-    return f"✅ 已成功匯入 {len(valid_rows)} 筆{import_type}資料", []
+        return f"⚠️ 匯入失敗，已全部復原，沒有寫入任何資料：{e}", state
+    msg = f"✅ 已成功匯入 {len(rows)} 筆{import_type}資料"
+    added = sum(len(n) for n in new_names.values())
+    if added:
+        msg += f"，並新增 {added} 筆基礎資料"
+    return msg, []
 
 
 def reset_import_preview(import_type):
