@@ -10,7 +10,7 @@ from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from config import DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, APP_NAME
+from config import DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, APP_NAME, BACKUP_DIR
 
 _db_local = threading.local()
 
@@ -2034,6 +2034,209 @@ def reset_import_preview(import_type):
     return pd.DataFrame(columns=["列號", "狀態"] + IMPORT_TYPES[import_type]), [], ""
 
 
+# ========== 備份/還原 ==========
+# 備份檔是純文字的 .sql：每張資料表一段 DROP / CREATE，之後每筆資料一行 INSERT。
+# 不用 mysqldump，因為它在 Windows 上處理中文資料庫名稱會出錯。
+
+RESTORE_CONFIRM_WORD = "還原"
+_SAFE_STATEMENT = re.compile(
+    r"^(DROP TABLE IF EXISTS `[^`]+`;"
+    r"|CREATE TABLE `[^`]+` \("
+    r"|INSERT INTO `[^`]+` (\(|VALUES \()"  # 有欄位清單的是新格式，VALUES 直接接資料的是早期手動備份的格式
+    r"|SET FOREIGN_KEY_CHECKS=[01];"
+    r"|SET NAMES utf8mb4;)"
+)
+_INSERT_TABLE = re.compile(r"^INSERT INTO `([^`]+)`")
+_CREATE_TABLE = re.compile(r"^CREATE TABLE `([^`]+)`")
+
+
+def new_backup_path(kind="備份"):
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    return os.path.join(BACKUP_DIR, f"{DB_NAME}_{kind}_{datetime.now():%Y%m%d_%H%M%S}.sql")
+
+
+def dump_database(conn, path):
+    """把整個資料庫寫成 .sql 檔，回傳 {資料表: 筆數}。
+    用一致性快照讀取，備份途中就算有人新增資料，各張表的內容也會是同一個時間點"""
+    cur = conn.cursor()
+    counts = {}
+    cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+    try:
+        cur.execute("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'")
+        tables = [row[0] for row in cur.fetchall()]
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(f"-- ERP-BACKUP v1\n-- 資料庫：{DB_NAME}\n-- 時間：{datetime.now():%Y-%m-%d %H:%M:%S}\n")
+            f.write("SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n\n")
+            for t in tables:
+                cur.execute(f"SHOW CREATE TABLE `{t}`")
+                f.write(f"DROP TABLE IF EXISTS `{t}`;\n{cur.fetchone()[1]};\n")
+                cur.execute(f"SELECT * FROM `{t}`")
+                cols = ", ".join(f"`{d[0]}`" for d in cur.description)
+                n = 0
+                for row in cur.fetchall():
+                    f.write(f"INSERT INTO `{t}` ({cols}) VALUES ({', '.join(conn.literal(v) for v in row)});\n")
+                    n += 1
+                counts[t] = n
+                f.write("\n")
+            f.write("SET FOREIGN_KEY_CHECKS=1;\n")
+    finally:
+        cur.execute("COMMIT")
+    return counts
+
+
+def parse_backup_file(path):
+    """讀取備份檔，切成一句一句的 SQL。每句都必須是備份檔會出現的那幾種，不符合就整個檔案拒絕，
+    避免有人上傳夾帶其他指令的檔案。回傳 (SQL 清單, {資料表: 檔內筆數})"""
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    statements, buf = [], []
+    for line in text.split("\n"):
+        if not buf and (not line.strip() or line.startswith("--")):
+            continue
+        buf.append(line)
+        if line.rstrip().endswith(";"):
+            statements.append("\n".join(buf))
+            buf = []
+    if buf:
+        raise ValueError("檔案結尾不完整，可能下載或複製到一半")
+    counts, has_create = {}, False
+    for st in statements:
+        if not _SAFE_STATEMENT.match(st):
+            raise ValueError(f"檔案中有不認得的指令，已拒絕：{st[:60]}")
+        m = _CREATE_TABLE.match(st)
+        if m:
+            has_create = True
+            counts.setdefault(m.group(1), 0)
+        m = _INSERT_TABLE.match(st)
+        if m:
+            counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+    if not has_create:
+        raise ValueError("這不是 ERP 的備份檔（找不到任何資料表）")
+    return statements, counts
+
+
+def restore_database(conn, path):
+    """用備份檔覆蓋資料庫。DROP/CREATE 會讓 MySQL 自動提交，所以無法整個復原；
+    呼叫前務必先做好備份。回傳還原後 {資料表: 筆數}"""
+    statements, _ = parse_backup_file(path)
+    cur = conn.cursor()
+    conn.autocommit(False)  # 資料的 INSERT 集中提交，比一筆筆提交快很多
+    try:
+        cur.execute("SET FOREIGN_KEY_CHECKS=0")
+        for st in statements:
+            cur.execute(st)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.execute("SET FOREIGN_KEY_CHECKS=1")
+        conn.autocommit(True)
+    return count_rows(conn)
+
+
+def count_rows(conn):
+    cur = conn.cursor()
+    cur.execute("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'")
+    counts = {}
+    for t, _type in cur.fetchall():
+        cur.execute(f"SELECT COUNT(*) FROM `{t}`")
+        counts[t] = cur.fetchone()[0]
+    return counts
+
+
+def list_backups():
+    """備份資料夾裡的 .sql 檔，由新到舊：[(檔名, 大小KB, 時間), ...]"""
+    if not os.path.isdir(BACKUP_DIR):
+        return []
+    files = [os.path.join(BACKUP_DIR, n) for n in os.listdir(BACKUP_DIR) if n.lower().endswith(".sql")]
+    files.sort(key=os.path.getmtime, reverse=True)
+    return [(os.path.basename(p), round(os.path.getsize(p) / 1024, 1),
+             datetime.fromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M:%S")) for p in files]
+
+
+def backup_list_updates():
+    items = list_backups()
+    return gr.update(value=[list(i) for i in items]), gr.update(choices=[i[0] for i in items])
+
+
+def do_backup():
+    path = new_backup_path()
+    try:
+        counts = dump_database(_get_db_connection(), path)
+    except Exception as e:
+        if os.path.exists(path):
+            os.remove(path)
+        return None, f"⚠️ 備份失敗：{e}", *backup_list_updates()
+    total = sum(counts.values())
+    msg = f"✅ 備份完成：共 {len(counts)} 張資料表、{total:,} 筆資料\n\n存放位置：`{path}`\n\n也可以點下方檔案直接下載一份。"
+    return path, msg, *backup_list_updates()
+
+
+def resolve_restore_source(uploaded, chosen):
+    """上傳的檔案優先，沒有才用下拉選單選的備份"""
+    if uploaded:
+        return uploaded
+    if chosen:
+        path = os.path.join(BACKUP_DIR, os.path.basename(chosen))  # basename 避免跑到備份資料夾以外
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def inspect_backup(uploaded, chosen):
+    """還原前先看備份檔的內容，跟目前資料庫比對筆數，讓人確認是不是選對檔案"""
+    path = resolve_restore_source(uploaded, chosen)
+    if not path:
+        return pd.DataFrame(columns=["資料表", "備份檔筆數", "目前筆數"]), None, "⚠️ 請先上傳備份檔，或從下拉選單選一個備份"
+    try:
+        _, file_counts = parse_backup_file(path)
+    except Exception as e:
+        return pd.DataFrame(columns=["資料表", "備份檔筆數", "目前筆數"]), None, f"⚠️ 這個檔案不能用來還原：{e}"
+    current = count_rows(_get_db_connection())
+    rows = [[t, file_counts.get(t, "（備份檔沒有，不會動）"), current.get(t, "（目前沒有）")]
+            for t in sorted(set(file_counts) | set(current))]
+    msg = warning_box(
+        f"<b>即將用「{os.path.basename(path)}」覆蓋目前的資料。</b><br>"
+        "備份檔裡有的資料表，目前的內容會<b>全部被取代</b>；備份之後新增的資料會消失。<br>"
+        "還原前系統會先自動備份一份目前的資料，萬一還原錯了還能救回來。<br>"
+        f"確認要還原，請在下方輸入「{RESTORE_CONFIRM_WORD}」兩個字，再按「確認還原」。"
+    )
+    return pd.DataFrame(rows, columns=["資料表", "備份檔筆數", "目前筆數"]), path, msg
+
+
+def do_restore(path, confirm_text):
+    if not path:
+        return "⚠️ 請先按「檢查備份檔」，確認要還原的內容", gr.update(), gr.update(), gr.update()
+    if (confirm_text or "").strip() != RESTORE_CONFIRM_WORD:
+        return f"⚠️ 請在確認欄輸入「{RESTORE_CONFIRM_WORD}」兩個字", gr.update(), gr.update(), gr.update()
+
+    conn = _get_db_connection()
+    safety_path = new_backup_path("還原前自動備份")
+    try:
+        dump_database(conn, safety_path)
+    except Exception as e:
+        return f"⚠️ 還原前的自動備份失敗，為了安全沒有還原：{e}", gr.update(), gr.update(), gr.update()
+
+    try:
+        after = restore_database(conn, path)
+    except Exception as e:
+        # 還原到一半失敗：資料可能是半新半舊，馬上用剛做的自動備份復原
+        try:
+            restore_database(conn, safety_path)
+            fixed = "已自動用還原前的備份復原，資料跟還原前一樣。"
+        except Exception as e2:
+            fixed = f"**自動復原也失敗（{e2}）**，請手動用這個檔案還原：`{safety_path}`"
+        return f"⚠️ 還原失敗：{e}\n\n{fixed}", *backup_list_updates(), gr.update(value="")
+    _, file_counts = parse_backup_file(path)
+    mismatch = [t for t, n in file_counts.items() if after.get(t) != n]
+    msg = (f"✅ 還原完成，共 {len(file_counts)} 張資料表。\n\n還原前的資料已自動備份：`{safety_path}`\n\n"
+           "**請重新整理瀏覽器頁面**，各分頁的選單才會更新。")
+    if mismatch:
+        msg += f"\n\n⚠️ 這幾張表的筆數跟備份檔不一致，請確認：{'、'.join(mismatch)}"
+    return msg, *backup_list_updates(), gr.update(value="")
+
+
 with gr.Blocks() as demo:
     with gr.Tabs() as tabs:
         with gr.TabItem("首頁", id="home"):
@@ -2480,6 +2683,49 @@ with gr.Blocks() as demo:
                         wrap=True,
                     )
 
+        with gr.TabItem("備份/還原", id="backup_restore") as backup_restore_tab:
+            with gr.Tabs():
+                with gr.TabItem("備份"):
+                    gr.Markdown(
+                        "把整個資料庫（所有資料表）存成一個 .sql 檔，放在備份資料夾，也可以直接下載一份。\n\n"
+                        "建議在大量匯入、刪除資料、或每週固定備份一次，並把備份檔另外複製到隨身碟或雲端。"
+                    )
+                    backup_btn = gr.Button("立即備份", variant="primary")
+                    backup_msg = gr.Markdown("")
+                    backup_file = gr.File(label="下載這次的備份", interactive=False)
+                    gr.Markdown(f"<h4 style='margin-top: 20px;'>備份資料夾裡的檔案</h4>存放位置：`{BACKUP_DIR}`")
+                    backup_table = gr.Dataframe(
+                        value=[list(i) for i in list_backups()],
+                        headers=["檔名", "大小(KB)", "時間"],
+                        interactive=False,
+                        wrap=True,
+                    )
+
+                with gr.TabItem("還原"):
+                    gr.Markdown(
+                        "用備份檔把資料庫**整個換回備份當時的樣子**。步驟：\n"
+                        "1. 從下拉選單選一個備份，或上傳備份檔（上傳的優先）\n"
+                        "2. 按「檢查備份檔」，確認每張表的筆數是你要的\n"
+                        f"3. 在確認欄輸入「{RESTORE_CONFIRM_WORD}」，按「確認還原」\n\n"
+                        "還原前會自動再備份一次目前的資料。還原時請避免同時有人在操作。"
+                    )
+                    restore_choice_dp = gr.Dropdown(
+                        choices=[i[0] for i in list_backups()], label="從備份資料夾選擇", interactive=True
+                    )
+                    restore_upload = gr.File(label="或上傳備份檔（.sql）", file_types=[".sql"], type="filepath")
+                    restore_check_btn = gr.Button("檢查備份檔")
+                    restore_info = gr.Markdown("")
+                    restore_compare = gr.Dataframe(
+                        value=pd.DataFrame(columns=["資料表", "備份檔筆數", "目前筆數"]),
+                        label="備份檔 vs 目前資料庫",
+                        interactive=False,
+                        wrap=True,
+                    )
+                    restore_path_state = gr.State(value=None)
+                    restore_confirm_tb = gr.Textbox(label=f"確認欄（輸入「{RESTORE_CONFIRM_WORD}」）")
+                    restore_btn = gr.Button("確認還原", variant="stop")
+                    restore_msg = gr.Markdown("")
+
     # ---------- 進貨 ----------
     insert.click(
         fn=insert_purchas,
@@ -2754,6 +3000,26 @@ with gr.Blocks() as demo:
     export_import_tab.select(
         fn=refresh_export_tab,
         outputs=[inv_year_dp, exp_sale_year_dp, exp_pur_year_dp, inv_cus_dp, exp_sale_cus_dp, exp_pur_sup_dp],
+    )
+
+    # ---------- 備份/還原 ----------
+    backup_btn.click(fn=do_backup, outputs=[backup_file, backup_msg, backup_table, restore_choice_dp])
+    backup_restore_tab.select(fn=backup_list_updates, outputs=[backup_table, restore_choice_dp])
+    restore_check_btn.click(
+        fn=inspect_backup,
+        inputs=[restore_upload, restore_choice_dp],
+        outputs=[restore_compare, restore_path_state, restore_info],
+    )
+    # 換了檔案就要重新檢查，避免檢查的是 A 檔、實際還原的卻是 B 檔
+    for _src in (restore_upload, restore_choice_dp):
+        _src.change(
+            fn=lambda: (pd.DataFrame(columns=["資料表", "備份檔筆數", "目前筆數"]), None, ""),
+            outputs=[restore_compare, restore_path_state, restore_info],
+        )
+    restore_btn.click(
+        fn=do_restore,
+        inputs=[restore_path_state, restore_confirm_tb],
+        outputs=[restore_msg, backup_table, restore_choice_dp, restore_confirm_tb],
     )
 
     template_btn.click(fn=download_import_template, inputs=import_type_dp, outputs=template_file)
