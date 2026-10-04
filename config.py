@@ -26,3 +26,5 @@ DB_USER = os.getenv("DB_USER", "root")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_NAME = os.getenv("DB_NAME", "erp_demo")
 APP_NAME = os.getenv("APP_NAME", "範例商行")
+# 備份檔的存放資料夾；沒設定時放在程式旁邊的 backups 資料夾
+BACKUP_DIR = os.getenv("BACKUP_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")

@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ERP 資料庫備份（含真實客戶與金額資料，不上傳）
+backups/
