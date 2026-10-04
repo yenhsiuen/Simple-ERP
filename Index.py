@@ -10,7 +10,7 @@ from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from config import DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, APP_NAME, BACKUP_DIR
+from config import DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, APP_NAME, BACKUP_DIR, APP_USER, APP_PASSWORD
 
 _db_local = threading.local()
 
@@ -3038,8 +3038,12 @@ with gr.Blocks() as demo:
     )
 
 
+if bool(APP_USER) != bool(APP_PASSWORD):
+    print("⚠️ APP_USER 和 APP_PASSWORD 只填了一個，網頁登入沒有啟用；請在 .env 兩個都填，或兩個都不填。")
+login = (APP_USER, APP_PASSWORD) if APP_USER and APP_PASSWORD else None
+
 try:
-    demo.launch()
+    demo.launch(auth=login, auth_message=f"{APP_NAME} ERP 登入" if login else None)
 finally:
     mycursor.close()
     mydb.close()
